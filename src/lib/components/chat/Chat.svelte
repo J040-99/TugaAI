@@ -65,8 +65,10 @@
 		getCodeBlockContents,
 		displayFileHandler,
 		getUsageTokenCount,
-		isRasterImageContentType
+		isRasterImageContentType,
+		enforceImagesTotalBudget
 	} from '$lib/utils';
+	import { getFriendlyErrorMessage } from '$lib/utils/errorMessages';
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
 	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
@@ -2758,13 +2760,168 @@
 		}
 	};
 
+	/**
+	 * Detect a degenerate loop in streamed text: the same non-trivial phrase
+	 * repeated many times in a row at the tail (classic VLM OCR hallucination).
+	 * Also catches short sentence-level loops (e.g. "Os dois processos…").
+	 * Returns truncated text + marker, or the original string if clean.
+	 */
+	const cutDegenerateRepetition = (text: string): string => {
+		if (!text || text.length < 80) return text;
+		// A) Exact tail-phrase loops (classic VLM stutter).
+		const checks: Array<{ len: number; minReps: number }> = [
+			{ len: 160, minReps: 4 },
+			{ len: 120, minReps: 4 },
+			{ len: 100, minReps: 4 },
+			{ len: 80, minReps: 4 },
+			{ len: 60, minReps: 4 },
+			{ len: 50, minReps: 5 },
+			{ len: 40, minReps: 5 },
+			{ len: 30, minReps: 6 }
+		];
+		for (const { len: phraseLen, minReps } of checks) {
+			if (text.length < phraseLen * minReps) continue;
+			const phrase = text.slice(-phraseLen);
+			const unique = new Set(phrase).size;
+			if (unique < Math.min(18, Math.floor(phraseLen * 0.5))) continue;
+			let count = 1;
+			let pos = text.length - phraseLen;
+			while (pos >= phraseLen) {
+				if (text.slice(pos - phraseLen, pos) === phrase) {
+					count++;
+					pos -= phraseLen;
+				} else {
+					break;
+				}
+			}
+			if (count >= minReps) {
+				return (
+					text.slice(0, pos + phraseLen) + '\n\n[Resposta cortada: o modelo entrou em repetição.]'
+				);
+			}
+		}
+
+		// B) Near-identical long sentences repeated 3+ times (slight wording drift).
+		if (text.length > 500) {
+			const sentences = text.split(/(?<=[.!?…])\s+/);
+			const norm = (s: string) =>
+				s
+					.toLowerCase()
+					.replace(/\s+/g, ' ')
+					.split('')
+					.filter((ch) => ch === ' ' || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+					.join('')
+					.trim();
+			const seen = new Map<string, { count: number; start: number }>();
+			let cursor = 0;
+			for (const s of sentences) {
+				const start = cursor;
+				cursor = start + s.length + 1;
+				const n = norm(s);
+				if (n.length < 60) continue;
+				const key = n.slice(0, 70);
+				const prev = seen.get(key);
+				if (!prev) {
+					seen.set(key, { count: 1, start });
+				} else {
+					prev.count++;
+					if (prev.count >= 3 && start > 100) {
+						let p = start;
+						while (p > 0 && /\s/.test(text[p - 1])) p--;
+						return text.slice(0, p) + '\n\n[Resposta cortada: o modelo entrou em repetição.]';
+					}
+				}
+			}
+		}
+		return text;
+	};
+
+	/**
+	 * Strip English/PT reasoning preamble the VLM sometimes dumps as content
+	 * ("The user wants me to…", "Let's…", "Wait…", "Image N:…").
+	 * Removes ALL leading meta lines (no tight line cap) until a line looks like
+	 * real transcription (Portuguese body text), keeping the rest.
+	 */
+	const stripMetaCommentary = (text: string): string => {
+		if (!text || text.length < 80) return text;
+		// Strong markers: instruction echo, reasoning chatter, image listings.
+		const metaRe =
+			/(?:^the user wants me|^let'?s (?:look|list|start|write|re-?read|check|find|do|see)|^wait[,.:]|^actually[,.:]|^looking (?:closely|at the)|^i need to|^first,? i |^okay[,.:]|^hmm[,.:]|^now,? i |^in this image|^page number:|^image \d|^the (?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth) image|^then there is a quote|^let'?s (?:double|do a|transcribe)|^transcribe in portuguese|^always reply in portuguese|^\[image reading|^\[instruções|^the instructions say|^to follow the specific)/i;
+		const lines = text.split(/\n/);
+		let i = 0;
+		while (i < lines.length) {
+			const line = lines[i].trim();
+			if (line === '') {
+				// Blank line: keep going if we haven't found body yet.
+				i++;
+				continue;
+			}
+			if (metaRe.test(line)) {
+				i++;
+				continue;
+			}
+			// Long English-only commentary line (no Portuguese diacritics).
+			const looksEnglish =
+				/\b(the|and|that|with|this|from|they|which|there|would|should|been|were)\b/i.test(line) &&
+				!/[àáâãéêíóôõúçÁÂÃÉÊÍÓÔÕÚÇ]/.test(line) &&
+				line.length > 30;
+			if (looksEnglish) {
+				i++;
+				continue;
+			}
+			// Short pure-English meta fragments without accents.
+			if (
+				/^(?:let|wait|now|then|so|but|ok|okay|hmm|right|good)[\s,:.]/i.test(line) &&
+				!/[àáâãéêíóôõúç]/i.test(line)
+			) {
+				i++;
+				continue;
+			}
+			break;
+		}
+		if (i === 0) return text;
+		const rest = lines.slice(i).join('\n').trim();
+		if (rest.length < 40) return text;
+		return rest;
+	};
+
+	const finalizeAssistantContent = (text: string): string =>
+		cutDegenerateRepetition(stripMetaCommentary(text));
+
+	/** Cut degenerate loops inside reasoning/output items (Thought stream). */
+	const cutOutputRepetition = (output: unknown): unknown => {
+		if (!Array.isArray(output)) return output;
+		for (const item of output as any[]) {
+			if (!item || typeof item !== 'object') continue;
+			for (const key of ['content', 'summary', 'text'] as const) {
+				const val = (item as any)[key];
+				if (typeof val === 'string') {
+					const cut = cutDegenerateRepetition(val);
+					if (cut !== val) (item as any)[key] = cut;
+				} else if (Array.isArray(val)) {
+					for (const part of val) {
+						if (part && typeof part === 'object' && typeof part.text === 'string') {
+							const cut = cutDegenerateRepetition(part.text);
+							if (cut !== part.text) part.text = cut;
+						}
+					}
+				}
+			}
+		}
+		return output;
+	};
+
 	const responseCompletionEventHandler = (data, message) => {
-		message.output = applyResponseStreamEvent(message.output ?? [], data);
+		message.output = cutOutputRepetition(applyResponseStreamEvent(message.output ?? [], data));
 
 		if (data?.type === 'response.output_text.delta') {
 			const value = data.delta ?? '';
 			if (!(message.content == '' && value == '\n')) {
 				message.content += value;
+				const cut = cutDegenerateRepetition(message.content);
+				if (cut !== message.content) {
+					message.content = cut;
+				}
 
 				if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 					navigator.vibrate(5);
@@ -2772,7 +2929,7 @@
 				dispatchCallOverlayAudio(message);
 			}
 		} else if (data?.type === 'response.completed' || data?.type?.endsWith('.done')) {
-			message.content = getOutputText(message.output) || message.content;
+			message.content = finalizeAssistantContent(getOutputText(message.output) || message.content);
 		}
 
 		history.messages[message.id] = message;
@@ -2784,8 +2941,10 @@
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
-			message.output = output;
-			message.content = getOutputText(output);
+			message.output = cutOutputRepetition(output);
+			message.content = getOutputText(message.output);
+			// Live cut only — full meta-strip waits until done.
+			message.content = cutDegenerateRepetition(message.content);
 			if (
 				data.type === 'response.output_text.delta' &&
 				navigator.vibrate &&
@@ -2808,6 +2967,7 @@
 			if (choices[0]?.message?.content) {
 				// Non-stream response
 				message.content += choices[0]?.message?.content;
+				message.content = finalizeAssistantContent(message.content);
 				dispatchCallOverlayAudio(message);
 			} else {
 				// Stream response
@@ -2816,6 +2976,7 @@
 					console.log('Empty response');
 				} else {
 					message.content += value;
+					message.content = cutDegenerateRepetition(message.content);
 
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
@@ -2849,8 +3010,19 @@
 
 		if (done) {
 			message.done = true;
+			// Final cleanup: strip English meta preamble + cut any residual loop.
+			message.content = finalizeAssistantContent(
+				getOutputText(message?.output) || message.content || ''
+			);
+			if (message.output) {
+				// Keep output in sync when we trimmed the flattened content.
+				message.output = message.output;
+			}
 			const visibleContent =
-				getOutputText(message?.output) || removeAllDetails(message?.content ?? '');
+				getOutputText(message?.output) || removeAllDetails(message.content ?? '');
+			// Prefer cleaned content for display/copy/TTS when getOutputText still has junk.
+			const finalVisible = finalizeAssistantContent(visibleContent);
+			message.content = finalVisible;
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(visibleContent);
@@ -3541,6 +3713,29 @@
 					(message) =>
 						message?.role === 'user' || message?.content?.trim() || message?.output?.length
 				);
+
+			// OpenRouter: total image content per request must stay under 30MB
+			// (e.g. 51 × 2.3MB history would be rejected with HTTP 413).
+			// Free routes (":free") get a tighter budget.
+			const isFreeModel = String(model?.id ?? '')
+				.toLowerCase()
+				.includes(':free');
+			const imageBudget = await enforceImagesTotalBudget(messages, undefined, {
+				free: isFreeModel
+			});
+			if (imageBudget.dropped > 0) {
+				console.warn(
+					`Dropped ${imageBudget.dropped} older image(s) from the request to fit OpenRouter's 30MB image limit (compressed ${imageBudget.compressed}).`
+				);
+				// Keep only messages that still have content after image removal.
+				messages = messages.filter(
+					(message) =>
+						message?.role === 'user' ||
+						(typeof message?.content === 'string' && message.content.trim()) ||
+						(Array.isArray(message?.content) && message.content.length > 0) ||
+						message?.output?.length
+				);
+			}
 		}
 
 		const toolIds = [];
@@ -3638,20 +3833,26 @@
 		).catch(async (error) => {
 			console.log(error);
 
-			let errorMessage = error;
+			let errorMessage: any = error;
 			if (error?.error?.message) {
 				errorMessage = error.error.message;
 			} else if (error?.message) {
 				errorMessage = error.message;
 			}
 
-			if (typeof errorMessage === 'object') {
+			// Always prefer a friendly, localized message over the raw payload.
+			const friendly = friendlyErrorMessage(error) || friendlyErrorMessage(errorMessage);
+			if (friendly) {
+				errorMessage = friendly;
+			} else if (typeof errorMessage === 'object' || errorMessage == null || errorMessage === '') {
 				errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
 			}
 
 			toast.error(`${errorMessage}`);
 			responseMessage.error = {
-				content: error
+				content: errorMessage,
+				// Keep the untouched provider payload for debugging (admins only).
+				raw: error
 			};
 
 			responseMessage.done = true;
@@ -3708,6 +3909,19 @@
 		}
 	};
 
+	// Maps a raw provider payload to a localized, human message.
+	// Returns '' when the payload is unknown so callers can fall back to the
+	// original content.
+	const friendlyErrorMessage = (raw: unknown): string => {
+		const key = getFriendlyErrorMessage(raw);
+		if (!key) return '';
+		try {
+			return $i18n.t(key) || '';
+		} catch {
+			return '';
+		}
+	};
+
 	const handleOpenAIError = async (error, responseMessage) => {
 		let errorMessage = '';
 		let innerError;
@@ -3717,27 +3931,41 @@
 		}
 
 		console.error(innerError);
-		if ('detail' in innerError) {
+
+		const generic = $i18n.t(`Uh-oh! There was an issue with the response.`);
+
+		// Prefer a friendly, localized message over the raw provider payload.
+		let friendly = friendlyErrorMessage(innerError);
+
+		if (innerError && typeof innerError === 'object' && 'detail' in innerError) {
 			// FastAPI error
-			toast.error(innerError.detail);
-			errorMessage = innerError.detail;
-		} else if ('error' in innerError) {
-			// OpenAI error
-			if ('message' in innerError.error) {
-				toast.error(innerError.error.message);
-				errorMessage = innerError.error.message;
-			} else {
-				toast.error(innerError.error);
-				errorMessage = innerError.error;
-			}
-		} else if ('message' in innerError) {
-			// OpenAI error
-			toast.error(innerError.message);
-			errorMessage = innerError.message;
+			friendly = friendly || friendlyErrorMessage(innerError.detail);
+			errorMessage =
+				friendly || (typeof innerError.detail === 'string' ? innerError.detail : generic);
+			toast.error(errorMessage);
+		} else if (innerError && typeof innerError === 'object' && 'error' in innerError) {
+			// OpenAI / OpenRouter error
+			const rawMsg = 'message' in innerError.error ? innerError.error.message : innerError.error;
+			friendly = friendly || friendlyErrorMessage(innerError.error) || friendlyErrorMessage(rawMsg);
+			errorMessage = friendly || (typeof rawMsg === 'string' ? rawMsg : generic);
+			toast.error(errorMessage);
+		} else if (innerError && typeof innerError === 'object' && 'message' in innerError) {
+			friendly = friendly || friendlyErrorMessage(innerError.message);
+			errorMessage = friendly || innerError.message;
+			toast.error(errorMessage);
+		} else {
+			errorMessage = friendly || (typeof innerError === 'string' ? innerError : generic);
+			toast.error(errorMessage);
+		}
+
+		if (!errorMessage) {
+			errorMessage = generic;
 		}
 
 		responseMessage.error = {
-			content: $i18n.t(`Uh-oh! There was an issue with the response.`) + '\n' + errorMessage
+			content: errorMessage,
+			// Keep the untouched provider payload for debugging (admins only).
+			raw: error
 		};
 		responseMessage.done = true;
 

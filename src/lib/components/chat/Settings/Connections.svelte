@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount, getContext } from 'svelte';
+	import { goto } from '$app/navigation';
 
 	const i18n = getContext('i18n');
 
-	import { settings } from '$lib/stores';
+	import { settings, showSettings, mobile, showSidebar } from '$lib/stores';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -87,6 +88,21 @@
 						<p class="mt-1 text-[0.6875rem] leading-relaxed text-gray-400 dark:text-gray-600">
 							{$i18n.t('settings.personal.connections.addConnection.description')}
 						</p>
+						<a
+							href="/tutoriais"
+							class="mt-1.5 inline-block text-[0.6875rem] underline text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
+								showSettings.set(false);
+								await goto('/tutoriais');
+								if ($mobile) {
+									showSidebar.set(false);
+								}
+							}}
+						>
+							{$i18n.t('See tutorial: how to get an OpenRouter key')}
+						</a>
 					</div>
 
 					<Tooltip content={$i18n.t('settings.personal.connections.addConnection.label')}>
@@ -104,6 +120,42 @@
 				</div>
 
 				<div class="flex flex-col gap-2">
+					{#if (config?.OPENAI_API_BASE_URLS ?? []).length === 0}
+						<div
+							class="rounded-xl border border-dashed border-gray-200 px-4 py-5 text-center dark:border-gray-800"
+						>
+							<p class="text-xs text-gray-500 dark:text-gray-400">
+								{$i18n.t('Connect your OpenRouter key to start chatting')}
+							</p>
+							<div class="mt-3 flex flex-wrap justify-center gap-2">
+								<button
+									type="button"
+									class="rounded-full bg-black px-3.5 py-1.5 text-xs font-medium text-white transition hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100"
+									on:click={() => {
+										showConnectionModal = true;
+									}}
+								>
+									{$i18n.t('settings.personal.connections.addConnection.label')}
+								</button>
+								<a
+									href="/tutoriais"
+									class="rounded-full border border-gray-200 px-3.5 py-1.5 text-xs font-medium text-gray-700 transition hover:border-gray-400 dark:border-gray-700 dark:text-gray-200 dark:hover:border-gray-500"
+									on:click={async (e) => {
+										if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+										e.preventDefault();
+										showSettings.set(false);
+										await goto('/tutoriais');
+										if ($mobile) {
+											showSidebar.set(false);
+										}
+									}}
+								>
+									{$i18n.t('Tutorials')}
+								</a>
+							</div>
+						</div>
+					{/if}
+
 					{#each config?.OPENAI_API_BASE_URLS ?? [] as url, idx}
 						<Connection
 							bind:url

@@ -451,6 +451,246 @@ export const compressImage = async (imageUrl, maxWidth, maxHeight) => {
 		img.src = imageUrl;
 	});
 };
+
+/**
+ * OpenRouter rejects image payloads over 30 MB ("Downloaded image content cannot exceed 30MB").
+ * Data-URLs and re-downloaded files must stay under that cap (with headroom for base64/headers).
+ */
+export const OPENROUTER_MAX_IMAGE_BYTES = 30 * 1024 * 1024;
+/** Soft target so base64 expansion still fits under the 30 MB provider limit. */
+export const IMAGE_PAYLOAD_SOFT_LIMIT_BYTES = 22 * 1024 * 1024;
+
+const dataUrlApproxBytes = (dataUrl: string): number => {
+	const comma = dataUrl.indexOf(',');
+	if (comma < 0) return dataUrl.length;
+	const meta = dataUrl.slice(0, comma);
+	const payload = dataUrl.slice(comma + 1);
+	if (meta.includes(';base64')) {
+		return Math.floor((payload.length * 3) / 4);
+	}
+	return payload.length;
+};
+
+const loadImageFromDataUrl = (dataUrl: string): Promise<HTMLImageElement> =>
+	new Promise((resolve, reject) => {
+		const img = new Image();
+		img.onload = () => resolve(img);
+		img.onerror = reject;
+		img.src = dataUrl;
+	});
+
+const canvasToJpegDataUrl = (img: HTMLImageElement, width: number, height: number, quality: number) => {
+	const canvas = document.createElement('canvas');
+	canvas.width = width;
+	canvas.height = height;
+	canvas.getContext('2d')?.drawImage(img, 0, 0, width, height);
+	return canvas.toDataURL('image/jpeg', quality);
+};
+
+/**
+ * Compress a data-URL image until its decoded size is under `maxBytes`.
+ * Returns the original string if already within the limit.
+ */
+export const compressImageUnderMaxBytes = async (
+	dataUrl: string,
+	maxBytes: number = IMAGE_PAYLOAD_SOFT_LIMIT_BYTES,
+	opts: { startScale?: number; startQuality?: number } = {}
+): Promise<string> => {
+	if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image')) {
+		return dataUrl;
+	}
+	if (dataUrlApproxBytes(dataUrl) <= maxBytes) {
+		return dataUrl;
+	}
+
+	try {
+		const img = await loadImageFromDataUrl(dataUrl);
+		let scale = opts.startScale ?? 1;
+		let quality = opts.startQuality ?? 0.9;
+		let result = dataUrl;
+
+		for (let i = 0; i < 10; i++) {
+			const width = Math.max(1, Math.round(img.width * scale));
+			const height = Math.max(1, Math.round(img.height * scale));
+			result = canvasToJpegDataUrl(img, width, height, quality);
+			if (dataUrlApproxBytes(result) <= maxBytes) {
+				return result;
+			}
+			// Gentle shrink first — keep print/text detail for OCR.
+			scale *= 0.82;
+			if (scale < 0.5) {
+				quality = Math.max(0.55, quality - 0.08);
+			}
+		}
+		return result;
+	} catch {
+		return dataUrl;
+	}
+};
+
+export const getDataUrlApproxBytes = dataUrlApproxBytes;
+
+const isDataImage = (url: string) => typeof url === 'string' && url.startsWith('data:image');
+
+const estimateUrlBytes = async (url: string): Promise<number> => {
+	if (isDataImage(url)) return dataUrlApproxBytes(url);
+	try {
+		const res = await fetch(url, { method: 'GET' });
+		const blob = await res.blob();
+		return blob.size;
+	} catch {
+		// Unknown remote size — assume OpenRouter-style download cost.
+		return 2_300_000;
+	}
+};
+
+const urlToDataImage = async (url: string): Promise<string | null> => {
+	if (isDataImage(url)) return url;
+	try {
+		const res = await fetch(url);
+		if (!res.ok) return null;
+		const blob = await res.blob();
+		if (!blob.type.startsWith('image/')) return null;
+		return await new Promise((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result));
+			reader.onerror = () => resolve(null);
+			reader.readAsDataURL(blob);
+		});
+	} catch {
+		return null;
+	}
+};
+
+type ImagePartRef = {
+	message: any;
+	part: any;
+	url: string;
+	bytes: number;
+};
+
+/**
+ * OpenRouter caps total downloaded image content at 30 MB per request.
+ * Conversations with many large images (e.g. 51 × 2.3 MB) must fit a shared budget:
+ * compress in place, then drop the oldest images from the payload if still over.
+ * Chat history in the app is not modified — only the outgoing request.
+ */
+export const enforceImagesTotalBudget = async (
+	messages: any[],
+	totalBudgetBytes: number = IMAGE_PAYLOAD_SOFT_LIMIT_BYTES,
+	opts: { free?: boolean } = {}
+): Promise<{ dropped: number; compressed: number }> => {
+	// Free OpenRouter routes are stricter — tighter image budget.
+	if (opts.free) {
+		totalBudgetBytes = Math.min(totalBudgetBytes, 8 * 1024 * 1024);
+	}
+	const parts: ImagePartRef[] = [];
+
+	for (const message of messages) {
+		if (!Array.isArray(message?.content)) continue;
+		for (const part of message.content) {
+			if (part?.type !== 'image_url' || typeof part?.image_url?.url !== 'string') continue;
+			const url = part.image_url.url;
+			parts.push({
+				message,
+				part,
+				url,
+				bytes: isDataImage(url) ? dataUrlApproxBytes(url) : 0
+			});
+		}
+	}
+
+	if (parts.length === 0) return { dropped: 0, compressed: 0 };
+
+	// NVIDIA vLLM: at most 12 images per prompt — drop oldest first.
+	const MAX_IMAGES = 12;
+	let droppedCount = 0;
+	if (parts.length > MAX_IMAGES) {
+		const excess = parts.slice(0, parts.length - MAX_IMAGES);
+		for (const p of excess) {
+			const content = p.message.content;
+			const idx = content.indexOf(p.part);
+			if (idx >= 0) {
+				content.splice(idx, 1);
+				droppedCount++;
+			}
+		}
+		parts.splice(0, excess.length);
+		if (parts.length === 0) return { dropped: droppedCount, compressed: 0 };
+	}
+
+	// Resolve sizes for remote URLs (may be file API links).
+	for (const p of parts) {
+		if (p.bytes === 0) {
+			p.bytes = await estimateUrlBytes(p.url);
+		}
+	}
+
+	let total = parts.reduce((sum, p) => sum + p.bytes, 0);
+	let compressed = 0;
+	let dropped = 0;
+
+	if (total <= totalBudgetBytes) {
+		return { dropped: droppedCount, compressed: 0 };
+	}
+
+	// Share remaining budget across images; keep a floor so text stays readable.
+	const perImage = Math.max(
+		180 * 1024,
+		Math.floor(totalBudgetBytes / parts.length)
+	);
+
+	// Newest images (end of list) keep more quality: budget front-loads older ones.
+	for (let i = 0; i < parts.length; i++) {
+		const p = parts[i];
+		const age = parts.length === 1 ? 0 : i / (parts.length - 1);
+		// Older images get a tighter slice.
+		const target = Math.max(40 * 1024, Math.floor(perImage * (0.45 + 0.55 * age)));
+
+		let data = isDataImage(p.url) ? p.url : await urlToDataImage(p.url);
+		if (!data) {
+			// Cannot inline — leave URL; may still contribute to provider download total.
+			continue;
+		}
+
+		if (dataUrlApproxBytes(data) > target) {
+			data = await compressImageUnderMaxBytes(data, target, {
+				startScale: 0.95,
+				startQuality: 0.9
+			});
+			compressed++;
+		}
+
+		const newBytes = dataUrlApproxBytes(data);
+		total += newBytes - p.bytes;
+		p.bytes = newBytes;
+		p.url = data;
+		p.part.image_url.url = data;
+	}
+
+	// Still over? Drop oldest images from the outgoing payload only.
+	if (total > totalBudgetBytes) {
+		for (const p of parts) {
+			if (total <= totalBudgetBytes) break;
+			// Prefer dropping oldest first (start of conversation).
+			const idx = parts.indexOf(p);
+			if (idx >= parts.length - 3) continue; // always keep last few images
+			if (p.part.image_url && p.url) {
+				// Remove this image part; leave text parts intact.
+				const content = p.message.content;
+				const at = content.indexOf(p.part);
+				if (at >= 0) {
+					content.splice(at, 1);
+					total -= p.bytes;
+					dropped++;
+				}
+			}
+		}
+	}
+
+	return { dropped: dropped + droppedCount, compressed };
+};
+
 export const generateInitialsImage = (name) => {
 	const canvas = document.createElement('canvas');
 	const ctx = canvas.getContext('2d');

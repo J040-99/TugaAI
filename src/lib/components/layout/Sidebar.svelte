@@ -79,6 +79,7 @@
 	import PinnedModelList from './Sidebar/PinnedModelList.svelte';
 	import PinnedNoteList from './Sidebar/PinnedNoteList.svelte';
 	import CalendarIcon from './Sidebar/icons/Calendar.svelte';
+	import ChartBarIcon from '../icons/ChartBar.svelte';
 	import ClockIcon from './Sidebar/icons/Clock.svelte';
 	import CodeIcon from './Sidebar/icons/Code.svelte';
 	import EditPencilIcon from './Sidebar/icons/EditPencil.svelte';
@@ -182,6 +183,8 @@
 				);
 			case 'playground':
 				return $user?.role === 'admin';
+			case 'spending':
+				return true;
 			default:
 				return false;
 		}
@@ -193,7 +196,8 @@
 			workspace: { label: $i18n.t('Workspace'), href: '/workspace', iconType: 'workspace' },
 			automations: { label: $i18n.t('Automations'), href: '/automations', iconType: 'automations' },
 			calendar: { label: $i18n.t('Calendar'), href: '/calendar', iconType: 'calendar' },
-			playground: { label: $i18n.t('Playground'), href: '/playground', iconType: 'playground' }
+			playground: { label: $i18n.t('Playground'), href: '/playground', iconType: 'playground' },
+			spending: { label: $i18n.t('Spending'), href: '/spending', iconType: 'spending' }
 		};
 		return items[id];
 	};
@@ -203,7 +207,8 @@
 		workspace: '/workspace',
 		calendar: '/calendar',
 		automations: '/automations',
-		playground: '/playground'
+		playground: '/playground',
+		spending: '/spending'
 	};
 
 	const getActiveMenuItemId = (pathname) => {
@@ -1061,6 +1066,8 @@
 												<CalendarIcon className="size-4" strokeWidth="1.5" />
 											{:else if itemId === 'playground'}
 												<CodeIcon className="size-4" strokeWidth="1.5" />
+											{:else if itemId === 'spending'}
+												<ChartBarIcon className="size-4" strokeWidth="1.5" />
 											{/if}
 										</div>
 									</a>
@@ -1162,14 +1169,12 @@
 					</a>
 
 					<a href="/" class="flex flex-1 px-0.5" on:click={newChatHandler}>
-						<!-- LICENSE covers this Open WebUI sidebar name.
-					Do not alter, remove, obscure, or replace it except as LICENSE permits:
-					https://docs.openwebui.com/license. -->
+						<!-- LICENSE: identificação Open WebUI mantida no rodapé da sidebar. -->
 						<div
 							id="sidebar-webui-name"
 							class=" self-center font-normal text-gray-700 dark:text-gray-200"
 						>
-							{$WEBUI_NAME}
+							{$WEBUI_NAME.replace(/\s*\(Open WebUI\)\s*$/, '')}
 						</div>
 					</a>
 					<Tooltip
@@ -1283,6 +1288,8 @@
 													<CalendarIcon className="size-4" strokeWidth="1.5" />
 												{:else if itemId === 'playground'}
 													<CodeIcon className="size-4" strokeWidth="1.5" />
+												{:else if itemId === 'spending'}
+													<ChartBarIcon className="size-4" strokeWidth="1.5" />
 												{/if}
 											</div>
 
@@ -1741,6 +1748,21 @@
 								</button>
 							</UserMenu>
 						{/if}
+
+						<!-- LICENSE covers this Open WebUI footer identifier.
+						Do not alter, remove, obscure, or replace it except as LICENSE permits:
+						https://docs.openwebui.com/license. -->
+						<div class="flex justify-center pt-1 pb-0.5">
+							<a
+								href="https://openwebui.com"
+								target="_blank"
+								rel="noopener noreferrer"
+								class="text-[0.625rem] leading-none text-gray-400/70 hover:text-gray-500 dark:text-gray-600/80 dark:hover:text-gray-500 transition select-none"
+								draggable="false"
+							>
+								Open WebUI
+							</a>
+						</div>
 					</div>
 				</div>
 			</div>

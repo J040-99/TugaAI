@@ -34,6 +34,7 @@
 	import ViewSelector from './common/ViewSelector.svelte';
 	import TagSelector from './common/TagSelector.svelte';
 	import Loader from '../common/Loader.svelte';
+	import WorkspaceEmptyState from './common/WorkspaceEmptyState.svelte';
 
 	type KnowledgeListItem = {
 		id: string;
@@ -537,7 +538,7 @@
 						</div>
 					</Loader>
 				{/if}
-			{:else}
+			{:else if query || viewOption || sourceOption}
 				<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
 					<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
 						<div class="mb-1.5 text-sm">{$i18n.t('No knowledge found')}</div>
@@ -546,6 +547,19 @@
 						</div>
 					</div>
 				</div>
+			{:else}
+				<WorkspaceEmptyState
+					icon="knowledge"
+					title={$i18n.t('workspace.knowledge.empty.title')}
+					description={$i18n.t('workspace.knowledge.empty.description')}
+					hint={$i18n.t('workspace.knowledge.empty.hint')}
+					actionLabel={$i18n.t('workspace.knowledge.empty.action')}
+					secondaryLabel={$i18n.t('workspace.common.tutorials')}
+					secondaryHref="/tutoriais"
+					on:action={() => {
+						showCreateModal = true;
+					}}
+				/>
 			{/if}
 		{:else}
 			<div class="w-full h-full flex justify-center items-center py-10">

@@ -29,6 +29,19 @@ export default defineConfig({
 		sourcemap: true
 	},
 	server: {
+		// Não seguir pastas geradas/que se escrevem sozinhas — evita o watcher
+		// a disparar em loop (milhares de ficheiros em static/pyodide, build, etc.)
+		watch: {
+			ignored: [
+				'**/node_modules/**',
+				'**/build/**',
+				'**/backend/**',
+				'**/static/pyodide/**',
+				'**/.pytest_cache/**',
+				'**/.ruff_cache/**',
+				'**/*.log'
+			]
+		},
 		proxy: {
 			'/api': {
 				target: backendTarget,

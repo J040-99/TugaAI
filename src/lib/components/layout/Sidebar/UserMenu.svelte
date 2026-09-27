@@ -17,6 +17,7 @@
 	import UserStatusModal from './UserStatusModal.svelte';
 	import Emoji from '$lib/components/common/Emoji.svelte';
 	import CalendarIcon from './icons/Calendar.svelte';
+	import ChartBarIcon from '$lib/components/icons/ChartBar.svelte';
 	import ClockIcon from './icons/Clock.svelte';
 	import CodeIcon from './icons/Code.svelte';
 	import EmojiFaceIcon from './icons/EmojiFace.svelte';
@@ -116,6 +117,7 @@
 	<div slot="content">
 		<DropdownMenu className="{className} font-sans text-xs">
 			{#if $user}
+				<!-- Cabeçalho: conta -->
 				<div>
 					<button
 						class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-xs w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-left"
@@ -160,97 +162,239 @@
 						{/if}
 					</button>
 				</div>
-			{/if}
 
-			{#if profile}
-				{#if $user?.status_emoji || $user?.status_message}
-					<div class="user-menu-status">
-						<button
-							class="w-full h-[1.6875rem] gap-2 rounded-xl px-2 hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-xs flex items-center text-left"
-							type="button"
-							on:click={() => {
-								show = false;
-								showUserStatusModal = true;
-							}}
-						>
-							{#if $user?.status_emoji}
-								<div class="self-center shrink-0 size-4.5 flex items-center justify-center">
-									<Emoji className="size-3.5" shortCode={$user?.status_emoji} />
-								</div>
-							{/if}
-
-							<Tooltip
-								content={$user?.status_message}
-								className="self-center line-clamp-2 flex-1 text-left"
+				{#if profile}
+					{#if $user?.status_emoji || $user?.status_message}
+						<div class="user-menu-status">
+							<button
+								class="w-full h-[1.6875rem] gap-2 rounded-xl px-2 hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-xs flex items-center text-left"
+								type="button"
+								on:click={() => {
+									show = false;
+									showUserStatusModal = true;
+								}}
 							>
-								{$user?.status_message}
-							</Tooltip>
+								{#if $user?.status_emoji}
+									<div class="self-center shrink-0 size-4.5 flex items-center justify-center">
+										<Emoji className="size-3.5" shortCode={$user?.status_emoji} />
+									</div>
+								{/if}
 
-							<div class="self-center">
-								<Tooltip content={$i18n.t('Clear status')}>
-									<button
-										class="flex size-5 items-center justify-center"
-										type="button"
-										on:click={async (e) => {
-											e.preventDefault();
-											e.stopPropagation();
-											e.stopImmediatePropagation();
-
-											const res = await updateUserStatus(localStorage.token, {
-												status_emoji: '',
-												status_message: ''
-											});
-
-											if (res) {
-												toast.success($i18n.t('Status cleared successfully'));
-												user.set(await getSessionUser(localStorage.token));
-											} else {
-												toast.error($i18n.t('Failed to clear status'));
-											}
-										}}
-									>
-										<XMarkIcon className="size-3.5 opacity-50" strokeWidth="1.5" />
-									</button>
+								<Tooltip
+									content={$user?.status_message}
+									className="self-center line-clamp-2 flex-1 text-left"
+								>
+									{$user?.status_message}
 								</Tooltip>
-							</div>
-						</button>
-					</div>
-				{:else}
-					<div class="user-menu-status">
-						<button
-							class="w-full h-[1.6875rem] gap-2 rounded-xl px-2 hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-xs flex items-center text-left"
-							type="button"
-							on:click={() => {
+
+								<div class="self-center">
+									<Tooltip content={$i18n.t('Clear status')}>
+										<button
+											class="flex size-5 items-center justify-center"
+											type="button"
+											on:click={async (e) => {
+												e.preventDefault();
+												e.stopPropagation();
+												e.stopImmediatePropagation();
+
+												const res = await updateUserStatus(localStorage.token, {
+													status_emoji: '',
+													status_message: ''
+												});
+
+												if (res) {
+													toast.success($i18n.t('Status cleared successfully'));
+													user.set(await getSessionUser(localStorage.token));
+												} else {
+													toast.error($i18n.t('Failed to clear status'));
+												}
+											}}
+										>
+											<XMarkIcon className="size-3.5 opacity-50" strokeWidth="1.5" />
+										</button>
+									</Tooltip>
+								</div>
+							</button>
+						</div>
+					{:else}
+						<div class="user-menu-status">
+							<button
+								class="w-full h-[1.6875rem] gap-2 rounded-xl px-2 hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-xs flex items-center text-left"
+								type="button"
+								on:click={() => {
+									show = false;
+									showUserStatusModal = true;
+								}}
+							>
+								<div class="self-center shrink-0 size-4.5 flex items-center justify-center">
+									<EmojiFaceIcon className="size-3.5" strokeWidth="1.5" />
+								</div>
+								<div class="self-center truncate">{$i18n.t('Update your status')}</div>
+							</button>
+						</div>
+					{/if}
+				{/if}
+
+				<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
+
+				<!-- Secção: Funcionalidades -->
+				<div
+					class="px-2 pt-1.5 pb-0.5 text-[0.625rem] font-medium tracking-wider text-gray-400 uppercase dark:text-gray-500"
+					role="presentation"
+				>
+					{$i18n.t('Features')}
+				</div>
+
+				{#if ($config?.features?.enable_notes ?? false) && ($user?.role === 'admin' || ($user?.permissions?.features?.notes ?? true))}
+					<div
+						class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
+					>
+						<a
+							href="/notes"
+							draggable="false"
+							class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
 								show = false;
-								showUserStatusModal = true;
+								goto('/notes');
+								if ($mobile) {
+									await tick();
+									showSidebar.set(false);
+								}
 							}}
 						>
-							<div class="self-center shrink-0 size-4.5 flex items-center justify-center">
-								<EmojiFaceIcon className="size-3.5" strokeWidth="1.5" />
+							<div class="self-center">
+								<NotesIcon className="size-3.5" strokeWidth="1.5" />
 							</div>
-							<div class="self-center truncate">{$i18n.t('Update your status')}</div>
-						</button>
+							<div class="self-center truncate">{$i18n.t('Notes')}</div>
+						</a>
+						{#if shiftKey}
+							<Tooltip
+								content={isPinned('notes')
+									? $i18n.t('Unpin from Sidebar')
+									: $i18n.t('Pin to Sidebar')}
+							>
+								<button
+									type="button"
+									class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
+									on:click|preventDefault|stopPropagation={() => togglePin('notes')}
+								>
+									{#if isPinned('notes')}
+										<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
+									{:else}
+										<PinIcon className="size-3.5" strokeWidth="1.5" />
+									{/if}
+								</button>
+							</Tooltip>
+						{/if}
 					</div>
 				{/if}
-			{/if}
 
-			{#if profile}
-				<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
-			{/if}
+				{#if $config?.features?.enable_calendar && ($user?.role === 'admin' || $user?.permissions?.features?.calendar)}
+					<div
+						class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
+					>
+						<a
+							href="/calendar"
+							draggable="false"
+							class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
+								show = false;
+								goto('/calendar');
+								if ($mobile) {
+									await tick();
+									showSidebar.set(false);
+								}
+							}}
+						>
+							<div class="self-center">
+								<CalendarIcon className="size-3.5" strokeWidth="1.5" />
+							</div>
+							<div class="self-center truncate">{$i18n.t('Calendar')}</div>
+						</a>
+						{#if shiftKey}
+							<Tooltip
+								content={isPinned('calendar')
+									? $i18n.t('Unpin from Sidebar')
+									: $i18n.t('Pin to Sidebar')}
+							>
+								<button
+									type="button"
+									class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
+									on:click|preventDefault|stopPropagation={() => togglePin('calendar')}
+								>
+									{#if isPinned('calendar')}
+										<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
+									{:else}
+										<PinIcon className="size-3.5" strokeWidth="1.5" />
+									{/if}
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
+				{/if}
 
-			{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models || $user?.permissions?.workspace?.knowledge || $user?.permissions?.workspace?.prompts || $user?.permissions?.workspace?.tools || $user?.permissions?.workspace?.skills}
+				{#if $config?.features?.enable_automations && ($user?.role === 'admin' || $user?.permissions?.features?.automations)}
+					<div
+						class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
+					>
+						<a
+							href="/automations"
+							draggable="false"
+							class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
+								show = false;
+								goto('/automations');
+								if ($mobile) {
+									await tick();
+									showSidebar.set(false);
+								}
+							}}
+						>
+							<div class="self-center">
+								<ClockIcon className="size-3.5" strokeWidth="1.5" />
+							</div>
+							<div class="self-center truncate">{$i18n.t('Automations')}</div>
+						</a>
+						{#if shiftKey}
+							<Tooltip
+								content={isPinned('automations')
+									? $i18n.t('Unpin from Sidebar')
+									: $i18n.t('Pin to Sidebar')}
+							>
+								<button
+									type="button"
+									class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
+									on:click|preventDefault|stopPropagation={() => togglePin('automations')}
+								>
+									{#if isPinned('automations')}
+										<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
+									{:else}
+										<PinIcon className="size-3.5" strokeWidth="1.5" />
+									{/if}
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
+				{/if}
+
 				<div
 					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
 				>
 					<a
-						href="/workspace"
+						href="/spending"
 						draggable="false"
 						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
 						on:click={async (e) => {
 							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
 							e.preventDefault();
 							show = false;
-							goto('/workspace');
+							goto('/spending');
 							if ($mobile) {
 								await tick();
 								showSidebar.set(false);
@@ -258,22 +402,22 @@
 						}}
 					>
 						<div class="self-center">
-							<WorkspaceIcon className="size-3.5" strokeWidth="1.5" />
+							<ChartBarIcon className="size-3.5" strokeWidth="1.5" />
 						</div>
-						<div class="self-center truncate">{$i18n.t('Workspace')}</div>
+						<div class="self-center truncate">{$i18n.t('Spending')}</div>
 					</a>
 					{#if shiftKey}
 						<Tooltip
-							content={isPinned('workspace')
+							content={isPinned('spending')
 								? $i18n.t('Unpin from Sidebar')
 								: $i18n.t('Pin to Sidebar')}
 						>
 							<button
 								type="button"
 								class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
-								on:click|preventDefault|stopPropagation={() => togglePin('workspace')}
+								on:click|preventDefault|stopPropagation={() => togglePin('spending')}
 							>
-								{#if isPinned('workspace')}
+								{#if isPinned('spending')}
 									<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
 								{:else}
 									<PinIcon className="size-3.5" strokeWidth="1.5" />
@@ -282,236 +426,162 @@
 						</Tooltip>
 					{/if}
 				</div>
-			{/if}
 
-			{#if ($config?.features?.enable_notes ?? false) && ($user?.role === 'admin' || ($user?.permissions?.features?.notes ?? true))}
-				<div
-					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
-				>
-					<a
-						href="/notes"
-						draggable="false"
-						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
-						on:click={async (e) => {
-							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
-							e.preventDefault();
-							show = false;
-							goto('/notes');
-							if ($mobile) {
-								await tick();
-								showSidebar.set(false);
-							}
-						}}
+				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models || $user?.permissions?.workspace?.knowledge || $user?.permissions?.workspace?.prompts || $user?.permissions?.workspace?.tools || $user?.permissions?.workspace?.skills}
+					<div
+						class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
 					>
-						<div class="self-center">
-							<NotesIcon className="size-3.5" strokeWidth="1.5" />
-						</div>
-						<div class="self-center truncate">{$i18n.t('Notes')}</div>
-					</a>
-					{#if shiftKey}
-						<Tooltip
-							content={isPinned('notes')
-								? $i18n.t('Unpin from Sidebar')
-								: $i18n.t('Pin to Sidebar')}
+						<a
+							href="/workspace"
+							draggable="false"
+							class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
+								show = false;
+								goto('/workspace');
+								if ($mobile) {
+									await tick();
+									showSidebar.set(false);
+								}
+							}}
 						>
-							<button
-								type="button"
-								class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
-								on:click|preventDefault|stopPropagation={() => togglePin('notes')}
+							<div class="self-center">
+								<WorkspaceIcon className="size-3.5" strokeWidth="1.5" />
+							</div>
+							<div class="self-center truncate">{$i18n.t('Workspace')}</div>
+						</a>
+						{#if shiftKey}
+							<Tooltip
+								content={isPinned('workspace')
+									? $i18n.t('Unpin from Sidebar')
+									: $i18n.t('Pin to Sidebar')}
 							>
-								{#if isPinned('notes')}
-									<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
-								{:else}
-									<PinIcon className="size-3.5" strokeWidth="1.5" />
-								{/if}
-							</button>
-						</Tooltip>
-					{/if}
-				</div>
-			{/if}
+								<button
+									type="button"
+									class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
+									on:click|preventDefault|stopPropagation={() => togglePin('workspace')}
+								>
+									{#if isPinned('workspace')}
+										<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
+									{:else}
+										<PinIcon className="size-3.5" strokeWidth="1.5" />
+									{/if}
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
+				{/if}
 
-			{#if $config?.features?.enable_calendar && ($user?.role === 'admin' || $user?.permissions?.features?.calendar)}
-				<div
-					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
-				>
-					<a
-						href="/calendar"
-						draggable="false"
-						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
-						on:click={async (e) => {
-							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
-							e.preventDefault();
-							show = false;
-							goto('/calendar');
-							if ($mobile) {
-								await tick();
-								showSidebar.set(false);
-							}
-						}}
+				<!-- Secção: Administração (apenas admin) -->
+				{#if role === 'admin'}
+					<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
+					<div
+						class="px-2 pt-1.5 pb-0.5 text-[0.625rem] font-medium tracking-wider text-gray-400 uppercase dark:text-gray-500"
+						role="presentation"
 					>
-						<div class="self-center">
-							<CalendarIcon className="size-3.5" strokeWidth="1.5" />
-						</div>
-						<div class="self-center truncate">{$i18n.t('Calendar')}</div>
-					</a>
-					{#if shiftKey}
-						<Tooltip
-							content={isPinned('calendar')
-								? $i18n.t('Unpin from Sidebar')
-								: $i18n.t('Pin to Sidebar')}
-						>
-							<button
-								type="button"
-								class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
-								on:click|preventDefault|stopPropagation={() => togglePin('calendar')}
-							>
-								{#if isPinned('calendar')}
-									<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
-								{:else}
-									<PinIcon className="size-3.5" strokeWidth="1.5" />
-								{/if}
-							</button>
-						</Tooltip>
-					{/if}
-				</div>
-			{/if}
+						{$i18n.t('Administration')}
+					</div>
 
-			{#if $config?.features?.enable_automations && ($user?.role === 'admin' || $user?.permissions?.features?.automations)}
-				<div
-					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
-				>
-					<a
-						href="/automations"
-						draggable="false"
-						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
-						on:click={async (e) => {
-							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
-							e.preventDefault();
-							show = false;
-							goto('/automations');
-							if ($mobile) {
-								await tick();
-								showSidebar.set(false);
-							}
-						}}
+					<div
+						class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
 					>
-						<div class="self-center">
-							<ClockIcon className="size-3.5" strokeWidth="1.5" />
-						</div>
-						<div class="self-center truncate">{$i18n.t('Automations')}</div>
-					</a>
-					{#if shiftKey}
-						<Tooltip
-							content={isPinned('automations')
-								? $i18n.t('Unpin from Sidebar')
-								: $i18n.t('Pin to Sidebar')}
+						<a
+							href="/playground"
+							draggable="false"
+							class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+							on:click={async (e) => {
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+								e.preventDefault();
+								show = false;
+								goto('/playground');
+								if ($mobile) {
+									await tick();
+									showSidebar.set(false);
+								}
+							}}
 						>
-							<button
-								type="button"
-								class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
-								on:click|preventDefault|stopPropagation={() => togglePin('automations')}
+							<div class="self-center">
+								<CodeIcon className="size-3.5" strokeWidth="1.5" />
+							</div>
+							<div class="self-center truncate">{$i18n.t('Playground')}</div>
+						</a>
+						{#if shiftKey}
+							<Tooltip
+								content={isPinned('playground')
+									? $i18n.t('Unpin from Sidebar')
+									: $i18n.t('Pin to Sidebar')}
 							>
-								{#if isPinned('automations')}
-									<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
-								{:else}
-									<PinIcon className="size-3.5" strokeWidth="1.5" />
-								{/if}
-							</button>
-						</Tooltip>
-					{/if}
-				</div>
-			{/if}
+								<button
+									type="button"
+									class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
+									on:click|preventDefault|stopPropagation={() => togglePin('playground')}
+								>
+									{#if isPinned('playground')}
+										<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
+									{:else}
+										<PinIcon className="size-3.5" strokeWidth="1.5" />
+									{/if}
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
 
-			{#if role === 'admin'}
-				<div
-					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
-				>
 					<a
-						href="/playground"
-						draggable="false"
-						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
-						on:click={async (e) => {
-							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
-							e.preventDefault();
-							show = false;
-							goto('/playground');
-							if ($mobile) {
-								await tick();
-								showSidebar.set(false);
-							}
-						}}
-					>
-						<div class="self-center">
-							<CodeIcon className="size-3.5" strokeWidth="1.5" />
-						</div>
-						<div class="self-center truncate">{$i18n.t('Playground')}</div>
-					</a>
-					{#if shiftKey}
-						<Tooltip
-							content={isPinned('playground')
-								? $i18n.t('Unpin from Sidebar')
-								: $i18n.t('Pin to Sidebar')}
-						>
-							<button
-								type="button"
-								class="p-1 mr-1 rounded-lg hover:bg-gray-100/60 dark:hover:bg-gray-700/60 transition"
-								on:click|preventDefault|stopPropagation={() => togglePin('playground')}
-							>
-								{#if isPinned('playground')}
-									<PinSlashIcon className="size-3.5" strokeWidth="1.5" />
-								{:else}
-									<PinIcon className="size-3.5" strokeWidth="1.5" />
-								{/if}
-							</button>
-						</Tooltip>
-					{/if}
-				</div>
-			{/if}
-
-			{#if help}
-				<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
-
-				<!-- {$i18n.t('Help')} -->
-
-				{#if $user?.role === 'admin'}
-					<a
-						href="https://docs.openwebui.com"
-						target="_blank"
+						href="/admin"
 						draggable="false"
 						class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
-						id="chat-share-button"
-						on:click={() => {
+						on:click={async (e) => {
+							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+							e.preventDefault();
 							show = false;
+							goto('/admin');
+							if ($mobile) {
+								await tick();
+								showSidebar.set(false);
+							}
 						}}
 					>
 						<div class="self-center">
-							<HelpCircleIcon className="size-3.5" />
+							<UserIcon className="size-3.5" strokeWidth="1.5" />
 						</div>
-						<div class=" self-center truncate">{$i18n.t('Documentation')}</div>
-					</a>
-
-					<!-- Releases -->
-					<a
-						href="https://github.com/open-webui/open-webui/releases"
-						target="_blank"
-						draggable="false"
-						class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
-						id="chat-share-button"
-						on:click={() => {
-							show = false;
-						}}
-					>
-						<div class="self-center">
-							<MapIcon className="size-3.5" />
-						</div>
-						<div class=" self-center truncate">{$i18n.t('Releases')}</div>
+						<div class=" self-center truncate">{$i18n.t('Admin Panel')}</div>
 					</a>
 				{/if}
+
+				<!-- Secção: Ajuda -->
+				<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
+				<div
+					class="px-2 pt-1.5 pb-0.5 text-[0.625rem] font-medium tracking-wider text-gray-400 uppercase dark:text-gray-500"
+					role="presentation"
+				>
+					{$i18n.t('Help')}
+				</div>
+
+				<a
+					href="/tutoriais"
+					draggable="false"
+					class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
+					on:click={async (e) => {
+						if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+						e.preventDefault();
+						show = false;
+						goto('/tutoriais');
+						if ($mobile) {
+							await tick();
+							showSidebar.set(false);
+						}
+					}}
+				>
+					<div class="self-center">
+						<HelpCircleIcon className="size-3.5" />
+					</div>
+					<div class=" self-center truncate">{$i18n.t('Tutorials')}</div>
+				</a>
 
 				<button
 					class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
 					type="button"
-					id="chat-share-button"
 					on:click={async () => {
 						show = false;
 						showSettings.set('shortcuts');
@@ -525,24 +595,58 @@
 					<div class="self-center">
 						<KeyIcon className="size-3.5" />
 					</div>
-					<div class=" self-center truncate">{$i18n.t('Keyboard')}</div>
+					<div class=" self-center truncate">{$i18n.t('Keyboard Shortcuts')}</div>
 				</button>
-			{/if}
 
-			<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
+				{#if help && role === 'admin'}
+					<a
+						href="https://docs.openwebui.com"
+						target="_blank"
+						draggable="false"
+						class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
+						on:click={() => {
+							show = false;
+						}}
+					>
+						<div class="self-center">
+							<HelpCircleIcon className="size-3.5" />
+						</div>
+						<div class=" self-center truncate">{$i18n.t('Documentation')}</div>
+					</a>
 
-			{#if role === 'admin'}
-				<a
-					href="/admin"
-					draggable="false"
+					<a
+						href="https://github.com/open-webui/open-webui/releases"
+						target="_blank"
+						draggable="false"
+						class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
+						on:click={() => {
+							show = false;
+						}}
+					>
+						<div class="self-center">
+							<MapIcon className="size-3.5" />
+						</div>
+						<div class=" self-center truncate">{$i18n.t('Releases')}</div>
+					</a>
+				{/if}
+
+				<!-- Secção: Conta -->
+				<hr class="border-gray-50/30 dark:border-gray-800/30 my-0.5 mx-1 p-0" />
+				<div
+					class="px-2 pt-1.5 pb-0.5 text-[0.625rem] font-medium tracking-wider text-gray-400 uppercase dark:text-gray-500"
+					role="presentation"
+				>
+					{$i18n.t('Account')}
+				</div>
+
+				<button
 					class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
-					on:click={async (e) => {
-						if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) {
-							return;
-						}
-						e.preventDefault();
+					type="button"
+					on:click={async () => {
 						show = false;
-						goto('/admin');
+
+						await showSettings.set(true);
+
 						if ($mobile) {
 							await tick();
 							showSidebar.set(false);
@@ -550,48 +654,28 @@
 					}}
 				>
 					<div class="self-center">
-						<UserIcon className="size-3.5" strokeWidth="1.5" />
+						<Settings className="size-3.5" strokeWidth="1.5" />
 					</div>
-					<div class=" self-center truncate">{$i18n.t('Admin Panel')}</div>
-				</a>
+					<div class=" self-center truncate">{$i18n.t('Settings')}</div>
+				</button>
+
+				<button
+					class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300"
+					type="button"
+					on:click={async () => {
+						const res = await userSignOut();
+						localStorage.removeItem('token');
+
+						location.href = getLogoutRedirectUrl(res?.redirect_url);
+						show = false;
+					}}
+				>
+					<div class="self-center">
+						<LogOutIcon className="size-3.5" strokeWidth="1.5" />
+					</div>
+					<div class=" self-center truncate">{$i18n.t('Sign Out')}</div>
+				</button>
 			{/if}
-
-			<button
-				class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
-				type="button"
-				on:click={async () => {
-					show = false;
-
-					await showSettings.set(true);
-
-					if ($mobile) {
-						await tick();
-						showSidebar.set(false);
-					}
-				}}
-			>
-				<div class="self-center">
-					<Settings className="size-3.5" strokeWidth="1.5" />
-				</div>
-				<div class=" self-center truncate">{$i18n.t('Settings')}</div>
-			</button>
-
-			<button
-				class="flex h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] w-full hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition cursor-pointer select-none"
-				type="button"
-				on:click={async () => {
-					const res = await userSignOut();
-					localStorage.removeItem('token');
-
-					location.href = getLogoutRedirectUrl(res?.redirect_url);
-					show = false;
-				}}
-			>
-				<div class="self-center">
-					<LogOutIcon className="size-3.5" strokeWidth="1.5" />
-				</div>
-				<div class=" self-center truncate">{$i18n.t('Sign Out')}</div>
-			</button>
 		</DropdownMenu>
 	</div>
 </Dropdown>

@@ -86,7 +86,15 @@
 		if ('serviceWorker' in navigator) {
 			try {
 				const registrations = await navigator.serviceWorker.getRegistrations();
-				await Promise.all(registrations.map((r) => r.unregister()));
+				// TugaAI: preservar o nosso /sw.js (PWA) ao limpar SWs do upstream
+				await Promise.all(
+					registrations
+						.filter((r) => {
+							const url = r.active?.scriptURL ?? r.installing?.scriptURL ?? r.waiting?.scriptURL ?? '';
+							return !url.endsWith('/sw.js');
+						})
+						.map((r) => r.unregister())
+				);
 				return true;
 			} catch (error) {
 				console.error('Error unregistering service workers:', error);
@@ -94,6 +102,32 @@
 			}
 		}
 		return false;
+	};
+
+	// Upstreams that share one pool across users (e.g. OpenRouter's `:free` models)
+	// reject direct-connection requests with HTTP 429 before processing them, so
+	// replaying the request after a short wait is safe.
+	const DIRECT_RATE_LIMIT_MAX_ATTEMPTS = 4; // 1 initial attempt + up to 3 retries
+	const DIRECT_RATE_LIMIT_BASE_DELAY = 1000; // ms; doubles on every retry
+	const DIRECT_RATE_LIMIT_MAX_DELAY = 10000; // ms
+
+	const directRateLimitRetryDelay = (response, attempt) => {
+		// Honour the upstream Retry-After header when present.
+		const retryAfter = response?.headers?.get('Retry-After');
+		if (retryAfter) {
+			const seconds = Number(retryAfter);
+			if (Number.isFinite(seconds) && seconds >= 0) {
+				return Math.min(DIRECT_RATE_LIMIT_MAX_DELAY, seconds * 1000);
+			}
+		}
+
+		// Exponential backoff with jitter so concurrent tabs do not retry in
+		// lockstep and immediately re-trigger the same limit.
+		const delay = Math.min(
+			DIRECT_RATE_LIMIT_MAX_DELAY,
+			DIRECT_RATE_LIMIT_BASE_DELAY * 2 ** attempt
+		);
+		return delay + Math.random() * (delay / 2);
 	};
 
 	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
@@ -663,11 +697,31 @@
 								form_data['model'] = form_data['model'].replace(`${prefixId}.`, ``);
 							}
 
-							const [res, controller] = await chatCompletion(
-								OPENAI_API_KEY,
-								form_data,
-								OPENAI_API_URL
-							);
+							// Replay rate-limited requests a bounded number of times before
+							// surfacing the 429: a rejected request was never processed
+							// upstream, so no duplicate side effects are possible.
+							let res = null;
+							for (let attempt = 0; attempt < DIRECT_RATE_LIMIT_MAX_ATTEMPTS; attempt++) {
+								[res] = await chatCompletion(OPENAI_API_KEY, form_data, OPENAI_API_URL);
+
+								if (!res || res.ok || res.status !== 429) {
+									break;
+								}
+
+								// Last attempt: leave the body for the error handling below.
+								if (attempt + 1 >= DIRECT_RATE_LIMIT_MAX_ATTEMPTS) {
+									break;
+								}
+
+								// Drain the interim error body so the connection is released.
+								await res.text().catch(() => null);
+
+								const delay = directRateLimitRetryDelay(res, attempt);
+								console.warn(
+									`chatCompletion: rate limited (429); retrying in ${Math.round(delay)}ms (attempt ${attempt + 2}/${DIRECT_RATE_LIMIT_MAX_ATTEMPTS})`
+								);
+								await new Promise((resolve) => setTimeout(resolve, delay));
+							}
 
 							if (res) {
 								// raise if the response is not ok
@@ -1076,6 +1130,34 @@
 	};
 
 	onMount(async () => {
+		// TugaAI PWA: registar service worker para instalação mobile
+		if (
+			'serviceWorker' in navigator &&
+			(location.protocol === 'https:' ||
+				location.hostname === 'localhost' ||
+				location.hostname === '127.0.0.1')
+		) {
+			try {
+				// Limpa TODAS as caches (inclui UI antiga do SW v1)
+				if (caches?.keys) {
+					const keys = await caches.keys();
+					await Promise.all(keys.map((k) => caches.delete(k)));
+				}
+				const registrations = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(registrations.map((r) => r.unregister()));
+				const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+				reg.update?.();
+				navigator.serviceWorker.addEventListener('controllerchange', () => {
+					if (!sessionStorage.getItem('tugaai-sw-reloaded')) {
+						sessionStorage.setItem('tugaai-sw-reloaded', '1');
+						location.reload();
+					}
+				});
+			} catch (e) {
+				console.warn('Service worker registration failed:', e);
+			}
+		}
+
 		const originalFetch = window.fetch.bind(window);
 		window.fetch = async (input, init) => {
 			const response = await originalFetch(input, init);

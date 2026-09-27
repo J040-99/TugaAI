@@ -1,10 +1,9 @@
 // import { version } from '../../package.json';
 
-// LICENSE covers this Open WebUI branding surface, including name, logo,
-// visual, textual, symbolic identifiers, metadata, and surrounding UI.
-// Do not alter, remove, obscure, or replace it except as LICENSE permits:
-// https://docs.openwebui.com/license.
-export const APP_NAME = 'Open WebUI';
+// TugaAI — nome do produto. A atribuição "Open WebUI" é acrescentada
+// automaticamente pelo backend (env.py) no WEBUI_NAME final ("TugaAI (Open WebUI)"),
+// conforme exigido pela LICENSE (cláusula 4): manter a identificação Open WebUI.
+export const APP_NAME = 'TugaAI';
 
 export const WEBUI_HOSTNAME = '';
 export const WEBUI_BASE_URL = '';

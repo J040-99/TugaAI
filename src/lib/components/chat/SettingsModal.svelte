@@ -119,7 +119,7 @@
 				loadPersonalUiSettings();
 			}
 			if (!show) {
-				selectedTab = 'general';
+				selectedTab = 'connections';
 				tabState = null;
 			}
 		}
@@ -129,7 +129,7 @@
 		show = false;
 		search = '';
 		lastShow = false;
-		selectedTab = 'general';
+		selectedTab = 'connections';
 		tabState = null;
 	}
 
@@ -140,12 +140,12 @@
 	let adminSettingGroups: Record<string, string> = {};
 
 	$: personalSettingGroups = {
+		connections: $i18n.t('Services'),
+		tools: $i18n.t('Services'),
 		general: $i18n.t('Basics'),
 		interface: $i18n.t('Basics'),
 		notifications: $i18n.t('Basics'),
 		shortcuts: $i18n.t('Basics'),
-		connections: $i18n.t('Services'),
-		tools: $i18n.t('Services'),
 		personalization: $i18n.t('Preferences'),
 		audio: $i18n.t('Preferences'),
 		data_controls: $i18n.t('Data'),
@@ -185,6 +185,18 @@
 	let allSettings: SettingsTab[];
 	$: allSettings = [
 		{
+			id: 'connections',
+			titleKey: 'settings.personal.connections.title',
+			title: $i18n.t('settings.personal.connections.title'),
+			searchPrefixes: ['settings.personal.connections.']
+		},
+		{
+			id: 'tools',
+			titleKey: 'settings.personal.tools.title',
+			title: $i18n.t('settings.personal.tools.title'),
+			searchPrefixes: ['settings.personal.tools.']
+		},
+		{
 			id: 'general',
 			titleKey: 'settings.personal.general.title',
 			title: $i18n.t('settings.personal.general.title'),
@@ -207,18 +219,6 @@
 			titleKey: 'settings.personal.shortcuts.title',
 			title: $i18n.t('settings.personal.shortcuts.title'),
 			searchPrefixes: ['settings.personal.shortcuts.']
-		},
-		{
-			id: 'connections',
-			titleKey: 'settings.personal.connections.title',
-			title: $i18n.t('settings.personal.connections.title'),
-			searchPrefixes: ['settings.personal.connections.']
-		},
-		{
-			id: 'tools',
-			titleKey: 'settings.personal.tools.title',
-			title: $i18n.t('settings.personal.tools.title'),
-			searchPrefixes: ['settings.personal.tools.']
 		},
 		{
 			id: 'personalization',
@@ -470,7 +470,7 @@
 				: 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
 		}`;
 
-	let selectedTab = 'general';
+	let selectedTab = 'connections';
 	const scrollToSelectedTab = async () => {
 		if (!browser || !modalShow || !selectedTab) {
 			return;
@@ -484,7 +484,7 @@
 	};
 
 	$: if ($user?.role !== 'admin' && isAdminTab(selectedTab)) {
-		selectedTab = 'general';
+		selectedTab = 'connections';
 	}
 
 	$: if (
@@ -493,7 +493,10 @@
 		availableSettings.length &&
 		!availableSettings.some((tab) => tab.id === selectedTab)
 	) {
-		selectedTab = 'general';
+		selectedTab =
+			availableSettings.find((tab) => tab.id === 'connections')?.id ??
+			availableSettings[0]?.id ??
+			'general';
 	}
 
 	$: if (modalShow && selectedTab) {

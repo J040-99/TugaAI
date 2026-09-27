@@ -47,6 +47,8 @@
 	import {
 		convertHeicToJpeg,
 		compressImage,
+		compressImageUnderMaxBytes,
+		OPENROUTER_MAX_IMAGE_BYTES,
 		createMessagesList,
 		extractContentFromFile,
 		extractCurlyBraceWords,
@@ -1173,6 +1175,11 @@
 					// Compress the image if settings or config require it
 					imageUrl = await compressImageHandler(imageUrl, $settings, $config);
 
+					// OpenRouter hard limit: image content cannot exceed 30MB
+					if (typeof imageUrl === 'string' && imageUrl.startsWith('data:image')) {
+						imageUrl = await compressImageUnderMaxBytes(imageUrl);
+					}
+
 					if ($temporaryChatEnabled) {
 						files = [
 							...files,
@@ -1183,6 +1190,14 @@
 						];
 					} else {
 						const blob = await (await fetch(imageUrl)).blob();
+						if (blob.size > OPENROUTER_MAX_IMAGE_BYTES) {
+							toast.error(
+								$i18n.t('Image is too large. Maximum size is {{maxSize}} MB.', {
+									maxSize: 30
+								})
+							);
+							return;
+						}
 						const compressedFile = new File([blob], file.name, { type: file.type });
 
 						uploadFileHandler(compressedFile, false);

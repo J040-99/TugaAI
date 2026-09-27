@@ -15,19 +15,26 @@
 	export let params = {};
 	export let embed = false;
 
-	// Persist collapsible section open/close state
-	const getOpen = (key: string, fallback = true): boolean => {
-		const v = localStorage.getItem(`chatControls.${key}`);
+	// Persist collapsible section open/close state (v2: começa fechado = UI limpa)
+	const getOpen = (key: string, fallback = false): boolean => {
+		const v = localStorage.getItem(`chatControls.v2.${key}`);
 		return v !== null ? v === 'true' : fallback;
 	};
 	const setOpen = (key: string) => (open: boolean) => {
-		localStorage.setItem(`chatControls.${key}`, String(open));
+		localStorage.setItem(`chatControls.v2.${key}`, String(open));
 	};
+
+	// Migração: limpa chaves antigas que forçavam secções abertas
+	try {
+		['files', 'valves', 'systemPrompt', 'advancedParams'].forEach((k) => {
+			localStorage.removeItem(`chatControls.${k}`);
+		});
+	} catch {}
 
 	let showFiles = getOpen('files');
 	let showValves = getOpen('valves', false);
-	let showSystemPrompt = getOpen('systemPrompt');
-	let showAdvancedParams = getOpen('advancedParams');
+	let showSystemPrompt = getOpen('systemPrompt', false);
+	let showAdvancedParams = getOpen('advancedParams', false);
 
 	const compactSectionButtonClass =
 		'w-full py-1 text-xs font-normal text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100 transition cursor-pointer select-none';

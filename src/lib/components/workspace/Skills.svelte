@@ -46,6 +46,7 @@
 	import Pagination from '../common/Pagination.svelte';
 	import ChevronDown from '../icons/ChevronDown.svelte';
 	import ChevronUp from '../icons/ChevronUp.svelte';
+	import WorkspaceEmptyState from './common/WorkspaceEmptyState.svelte';
 
 	let shiftKey = false;
 	let loaded = false;
@@ -603,7 +604,7 @@
 					<Pagination bind:page count={total} perPage={30} />
 				</div>
 			{/if}
-		{:else}
+		{:else if query}
 			<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
 				<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
 					<div class="mb-1.5 text-sm">{$i18n.t('No skills found')}</div>
@@ -612,6 +613,17 @@
 					</div>
 				</div>
 			</div>
+		{:else}
+			<WorkspaceEmptyState
+				icon="skills"
+				title={$i18n.t('workspace.skills.empty.title')}
+				description={$i18n.t('workspace.skills.empty.description')}
+				hint={$i18n.t('workspace.skills.empty.hint')}
+				actionLabel={$i18n.t('workspace.skills.empty.action')}
+				actionHref="/workspace/skills/create"
+				secondaryLabel={$i18n.t('workspace.common.tutorials')}
+				secondaryHref="/tutoriais"
+			/>
 		{/if}
 	</div>
 

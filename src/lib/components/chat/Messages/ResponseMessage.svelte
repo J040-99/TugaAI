@@ -903,7 +903,12 @@
 							{/if}
 
 							{#if message?.error}
-								<Error content={message?.error?.content ?? message.content} />
+								<Error
+									content={message?.error?.content ?? message.content}
+									onRetry={!readOnly && typeof regenerateResponse === 'function'
+										? () => regenerateResponse(message)
+										: null}
+								/>
 							{/if}
 
 							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}

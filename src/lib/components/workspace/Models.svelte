@@ -65,9 +65,9 @@
 	import DropdownMenu from '$lib/components/common/DropdownMenu.svelte';
 	import ViewSelector from './common/ViewSelector.svelte';
 	import TagSelector from './common/TagSelector.svelte';
-	import CommunityDiscover from './common/CommunityDiscover.svelte';
 	import Pagination from '../common/Pagination.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
+	import WorkspaceEmptyState from './common/WorkspaceEmptyState.svelte';
 
 	let shiftKey = false;
 
@@ -925,7 +925,7 @@
 				{#if total > 30}
 					<Pagination bind:page count={total} perPage={30} />
 				{/if}
-			{:else}
+			{:else if query}
 				<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
 					<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
 						<div class="mb-1.5 text-sm">{$i18n.t('No models found')}</div>
@@ -934,6 +934,21 @@
 						</div>
 					</div>
 				</div>
+			{:else}
+				<WorkspaceEmptyState
+					icon="models"
+					title={$i18n.t('workspace.models.empty.title')}
+					description={$i18n.t('workspace.models.empty.description')}
+					hint={($models ?? []).length > 0
+						? $i18n.t('workspace.models.empty.hintConnected', {
+								count: ($models ?? []).length
+							})
+						: $i18n.t('workspace.models.empty.hint')}
+					actionLabel={$i18n.t('workspace.models.empty.action')}
+					actionHref="/workspace/models/create"
+					secondaryLabel={$i18n.t('workspace.common.tutorials')}
+					secondaryHref="/tutoriais"
+				/>
 			{/if}
 		{:else}
 			<div class="w-full h-full flex justify-center items-center py-10">
@@ -941,14 +956,6 @@
 			</div>
 		{/if}
 	</div>
-
-	{#if $config?.features.enable_community_sharing}
-		<CommunityDiscover
-			href="https://openwebui.com/models"
-			title={$i18n.t('Discover a model')}
-			description={$i18n.t('Discover, download, and explore model presets')}
-		/>
-	{/if}
 {:else}
 	<div class="w-full h-full flex justify-center items-center">
 		<Spinner className="size-5" />

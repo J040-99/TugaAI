@@ -38,7 +38,7 @@
 	import GarbageBin from '../icons/GarbageBin.svelte';
 	import ViewSelector from './common/ViewSelector.svelte';
 	import TagSelector from './common/TagSelector.svelte';
-	import CommunityDiscover from './common/CommunityDiscover.svelte';
+	import WorkspaceEmptyState from './common/WorkspaceEmptyState.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
 	import Switch from '../common/Switch.svelte';
 	import Pagination from '../common/Pagination.svelte';
@@ -744,7 +744,7 @@
 					<Pagination bind:page count={total} perPage={30} />
 				</div>
 			{/if}
-		{:else}
+		{:else if query}
 			<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
 				<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
 					<div class="mb-1.5 text-sm">{$i18n.t('No prompts found')}</div>
@@ -753,16 +753,19 @@
 					</div>
 				</div>
 			</div>
+		{:else}
+			<WorkspaceEmptyState
+				icon="prompts"
+				title={$i18n.t('workspace.prompts.empty.title')}
+				description={$i18n.t('workspace.prompts.empty.description')}
+				hint={$i18n.t('workspace.prompts.empty.hint')}
+				actionLabel={$i18n.t('workspace.prompts.empty.action')}
+				actionHref="/workspace/prompts/create"
+				secondaryLabel={$i18n.t('workspace.common.tutorials')}
+				secondaryHref="/tutoriais"
+			/>
 		{/if}
 	</div>
-
-	{#if $config?.features.enable_community_sharing}
-		<CommunityDiscover
-			href="https://openwebui.com/prompts"
-			title={$i18n.t('Discover a prompt')}
-			description={$i18n.t('Discover, download, and explore custom prompts')}
-		/>
-	{/if}
 {:else}
 	<div class="w-full h-full flex justify-center items-center">
 		<Spinner className="size-5" />

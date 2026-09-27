@@ -1,4 +1,18 @@
 import { OPENAI_API_BASE_URL, WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+import { isRateLimitError } from '$lib/utils/errorMessages';
+import { toast } from 'svelte-sonner';
+import { get } from 'svelte/store';
+import i18n from '$lib/i18n';
+
+const RETRY_TOAST_ID = 'openai-chat-completion-retry';
+
+const translate = (key: string): string => {
+	try {
+		return get(i18n)?.t(key) ?? key;
+	} catch {
+		return key;
+	}
+};
 
 export const getErrorMessage = (err: any, fallback = 'Server connection failed') => {
 	const detail = err?.detail;
@@ -418,36 +432,100 @@ export const chatCompletion = async (
 	return [res, controller];
 };
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const generateOpenAIChatCompletion = async (
 	token: string = '',
 	body: object,
 	url: string = `${WEBUI_BASE_URL}/api`
 ) => {
-	let error = null;
+	// Upstream free/shared pools return 429 or ResourceExhausted (e.g. NVIDIA 16/16
+	// workers) — surface a friendly message after retrying.
+	// The backend already replays HTTP 429 up to RATE_LIMIT_MAX_ATTEMPTS times
+	// (see backend/open_webui/routers/openai.py); this call often arrives with
+	// HTTP 200 + {error:{code:429}} once those attempts are exhausted. Keep the
+	// client-side retry small (a single extra attempt) so the user is not left
+	// waiting through two stacked retry chains.
+	const maxAttempts = 2;
+	const delaysMs = [3000];
+	let lastError: any = null;
 
-	const res = await fetch(`${url}/chat/completions`, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${token}`,
-			'Content-Type': 'application/json'
-		},
-		credentials: 'include',
-		body: JSON.stringify(body)
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			error = getErrorMessage(err);
-			return null;
+	// Surface the backoff to the user: without it, a silent 3s wait looks like
+	// a frozen app. The toast auto-dismisses with the delay and is also removed
+	// explicitly on success or on the final failure.
+	const showRetrying = (delayMs: number, attempt: number) => {
+		toast.loading(translate('Retrying…'), {
+			id: RETRY_TOAST_ID,
+			duration: delayMs + 1500
 		});
+		console.warn(
+			`Rate limited (429) — retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}/${maxAttempts})`
+		);
+	};
 
-	if (error) {
-		throw error;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		let fetchError: any = null;
+		let payload: any = null;
+
+		payload = await fetch(`${url}/chat/completions`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json'
+			},
+			credentials: 'include',
+			body: JSON.stringify(body)
+		})
+			.then(async (res) => {
+				const json = await res.json().catch(() => null);
+				if (!res.ok) {
+					throw json ?? { error: { message: `HTTP ${res.status}` } };
+				}
+				return json;
+			})
+			.catch((err) => {
+				fetchError = err;
+				return null;
+			});
+
+		const rateLimited =
+			isRateLimitError(fetchError) ||
+			isRateLimitError((fetchError as any)?.error) ||
+			isRateLimitError(payload?.error) ||
+			payload?.error?.code === 429;
+
+		if (fetchError) {
+			lastError = fetchError;
+			if (rateLimited && attempt < maxAttempts) {
+				const delay = delaysMs[attempt - 1] ?? 5000;
+				showRetrying(delay, attempt + 1);
+				await sleep(delay);
+				continue;
+			}
+			toast.dismiss(RETRY_TOAST_ID);
+			// Preserve full object so callers can detect code 429 / rate-limit text.
+			throw fetchError;
+		}
+
+		// HTTP 200 but body carries a provider error (common Open WebUI pattern).
+		if (payload?.error) {
+			lastError = payload;
+			if (rateLimited && attempt < maxAttempts) {
+				const delay = delaysMs[attempt - 1] ?? 5000;
+				showRetrying(delay, attempt + 1);
+				await sleep(delay);
+				continue;
+			}
+			toast.dismiss(RETRY_TOAST_ID);
+			return payload; // Chat.svelte: res.error → handleOpenAIError
+		}
+
+		toast.dismiss(RETRY_TOAST_ID);
+		return payload;
 	}
 
-	return res;
+	toast.dismiss(RETRY_TOAST_ID);
+	throw lastError;
 };
 
 export const synthesizeOpenAISpeech = async (

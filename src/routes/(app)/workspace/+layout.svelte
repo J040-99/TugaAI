@@ -241,6 +241,24 @@
 
 				<!-- <div class="flex items-center text-xl font-normal">{$i18n.t('Workspace')}</div> -->
 			</div>
+
+			{#if activeWorkspaceSection}
+				<p
+					class="mt-1 mb-1 max-w-3xl text-xs leading-5 text-gray-500 dark:text-gray-400"
+				>
+					{#if activeWorkspaceSection === 'models'}
+						{$i18n.t('workspace.description.models')}
+					{:else if activeWorkspaceSection === 'knowledge'}
+						{$i18n.t('workspace.description.knowledge')}
+					{:else if activeWorkspaceSection === 'prompts'}
+						{$i18n.t('workspace.description.prompts')}
+					{:else if activeWorkspaceSection === 'skills'}
+						{$i18n.t('workspace.description.skills')}
+					{:else if activeWorkspaceSection === 'tools'}
+						{$i18n.t('workspace.description.tools')}
+					{/if}
+				</p>
+			{/if}
 		</nav>
 
 		<div

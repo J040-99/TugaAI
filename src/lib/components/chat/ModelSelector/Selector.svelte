@@ -12,6 +12,7 @@
 	import { flyAndScale } from '$lib/utils/transitions';
 
 	import { createEventDispatcher, onMount, getContext, tick } from 'svelte';
+	import { goto } from '$app/navigation';
 
 	import { deleteModel, getOllamaVersion, pullModel } from '$lib/apis/ollama';
 	import { deleteModelById } from '$lib/apis/models';
@@ -31,10 +32,21 @@
 		temporaryChatEnabled,
 		settings,
 		config,
-		showSettings
+		showSettings,
+		pinnedModels
 	} from '$lib/stores';
 	import { toast } from 'svelte-sonner';
 	import { capitalizeFirstLetter, sanitizeResponseContent, splitStream } from '$lib/utils';
+	import {
+		MODEL_CATEGORY_ORDER,
+		MODEL_SORT_KEYS,
+		getCategoryKey,
+		getRecentModelIds,
+		matchesCategory,
+		rememberModelUsage,
+		sortModelItems,
+		type ModelSortKey
+	} from '$lib/utils/modelCategories';
 	import {
 		resolveLocalizedModelDescription,
 		resolveLocalizedModelName
@@ -199,7 +211,9 @@
 
 	let selectedTag = '';
 	let selectedConnectionType = '';
+	let selectedCategory = '';
 	let selectedFilter = '';
+	let selectedSort: ModelSortKey = 'default';
 	let modelFilterItems = [];
 
 	let ollamaVersion = null;
@@ -260,6 +274,17 @@
 		updateFuse();
 	}
 
+	$: pinnedIdList = $pinnedModels ?? [];
+	let recentVersion = 0;
+	$: recentIdList = (recentVersion, getRecentModelIds());
+
+	const categoryLabel = (key: string) => {
+		if (key === 'used') return $i18n.t('models.category.used');
+		if (key === 'popular') return $i18n.t('models.category.popular');
+		if (key === 'free') return $i18n.t('models.category.free');
+		return $i18n.t('models.category.other');
+	};
+
 	$: filteredItems = (
 		searchValue
 			? fuse
@@ -287,6 +312,9 @@
 							return item.model?.direct;
 						}
 					})
+					.filter((item) =>
+						matchesCategory(item, selectedCategory, pinnedIdList, recentIdList)
+					)
 			: items
 					.filter((item) => {
 						if (selectedTag === '') {
@@ -307,7 +335,46 @@
 							return item.model?.direct;
 						}
 					})
-	).filter((item) => includeHidden || !(item.model?.info?.meta?.hidden ?? false));
+					.filter((item) =>
+						matchesCategory(item, selectedCategory, pinnedIdList, recentIdList)
+					)
+	)
+		.filter((item) => includeHidden || !(item.model?.info?.meta?.hidden ?? false))
+		.map((item) => item);
+
+	$: sortedItems = sortModelItems(filteredItems, selectedSort, pinnedIdList, recentIdList);
+
+	// Flat rows for virtual list: section headers + model items (same row height).
+	$: showSectionHeaders =
+		!searchValue &&
+		!selectedCategory &&
+		selectedSort === 'default' &&
+		sortedItems.length > 0;
+	$: displayRows = (() => {
+		if (!showSectionHeaders) {
+			return sortedItems.map((item) => ({ type: 'item', item }));
+		}
+
+		const groups = new Map();
+		for (const item of sortedItems) {
+			const key = getCategoryKey(item, pinnedIdList, recentIdList);
+			if (!groups.has(key)) groups.set(key, []);
+			groups.get(key).push(item);
+		}
+
+		const rows = [];
+		for (const key of MODEL_CATEGORY_ORDER) {
+			const group = groups.get(key);
+			if (!group?.length) continue;
+			rows.push({ type: 'header', key, label: categoryLabel(key) });
+			for (const item of group) {
+				rows.push({ type: 'item', item });
+			}
+		}
+		return rows;
+	})();
+
+	$: selectableRowCount = displayRows.filter((row) => row.type === 'item').length;
 
 	$: sanitizedSearchValue = searchValue.trim();
 	$: downloadTargets =
@@ -351,12 +418,65 @@
 	$: if (
 		selectedTag !== undefined ||
 		selectedConnectionType !== undefined ||
+		selectedCategory !== undefined ||
 		searchValue !== undefined
 	) {
 		resetView();
 	}
 
+	// Presence of each category for the filter menu (ignore the active category filter).
+	$: categoryPool = sortedItems.length || selectedCategory
+		? items
+				.filter((item) => includeHidden || !(item.model?.info?.meta?.hidden ?? false))
+				.filter((item) => {
+					if (selectedTag === '') return true;
+					return (item.model?.tags ?? [])
+						.map((tag) => tag.name.toLowerCase())
+						.includes(selectedTag.toLowerCase());
+				})
+				.filter((item) => {
+					if (selectedConnectionType === '') return true;
+					if (selectedConnectionType === 'local') return item.model?.connection_type === 'local';
+					if (selectedConnectionType === 'external')
+						return item.model?.connection_type === 'external';
+					if (selectedConnectionType === 'direct') return item.model?.direct;
+					return true;
+				})
+		: filteredItems;
+
+	$: hasUsed = categoryPool.some(
+		(item) => getCategoryKey(item, pinnedIdList, recentIdList) === 'used'
+	);
+	$: hasPopular = categoryPool.some(
+		(item) => getCategoryKey(item, pinnedIdList, recentIdList) === 'popular'
+	);
+	$: hasFree = categoryPool.some(
+		(item) => getCategoryKey(item, pinnedIdList, recentIdList) === 'free'
+	);
+	$: hasOther = categoryPool.some(
+		(item) => getCategoryKey(item, pinnedIdList, recentIdList) === 'other'
+	);
+
+	const sortLabel = (key: ModelSortKey) => {
+		if (key === 'default') return $i18n.t('models.sort.default');
+		if (key === 'used') return $i18n.t('models.sort.used');
+		if (key === 'cheap') return $i18n.t('models.sort.cheap');
+		if (key === 'expensive') return $i18n.t('models.sort.expensive');
+		if (key === 'az') return $i18n.t('models.sort.az');
+		if (key === 'za') return $i18n.t('models.sort.za');
+		return key;
+	};
+
+	$: sortItems = MODEL_SORT_KEYS.map((key) => ({
+		value: key,
+		label: sortLabel(key)
+	}));
+
 	$: modelFilterItems = [
+		...(hasUsed ? [{ value: 'category:used', label: categoryLabel('used') }] : []),
+		...(hasPopular ? [{ value: 'category:popular', label: categoryLabel('popular') }] : []),
+		...(hasFree ? [{ value: 'category:free', label: categoryLabel('free') }] : []),
+		...(hasOther ? [{ value: 'category:other', label: categoryLabel('other') }] : []),
 		...(items.find((item) => item.model?.connection_type === 'local')
 			? [{ value: 'connection:local', label: $i18n.t('Local') }]
 			: []),
@@ -369,36 +489,46 @@
 		...tags.map((tag) => ({ value: `tag:${tag}`, label: tag }))
 	];
 
-	$: selectedFilter = selectedConnectionType
-		? `connection:${selectedConnectionType}`
-		: selectedTag
-			? `tag:${selectedTag}`
-			: '';
+	$: selectedFilter = selectedCategory
+		? `category:${selectedCategory}`
+		: selectedConnectionType
+			? `connection:${selectedConnectionType}`
+			: selectedTag
+				? `tag:${selectedTag}`
+				: '';
 
 	const setModelFilter = (filterValue: string) => {
 		if (!filterValue) {
 			selectedConnectionType = '';
 			selectedTag = '';
+			selectedCategory = '';
+		} else if (filterValue.startsWith('category:')) {
+			selectedCategory = filterValue.replace('category:', '');
+			selectedConnectionType = '';
+			selectedTag = '';
 		} else if (filterValue.startsWith('connection:')) {
 			selectedConnectionType = filterValue.replace('connection:', '');
 			selectedTag = '';
+			selectedCategory = '';
 		} else if (filterValue.startsWith('tag:')) {
 			selectedConnectionType = '';
 			selectedTag = filterValue.replace('tag:', '');
+			selectedCategory = '';
 		}
 	};
 
 	const resetView = async () => {
 		await tick();
 
-		const selectedInFiltered = filteredItems.findIndex((item) => item.value === primaryValue);
+		const selectedRowIdx = displayRows.findIndex(
+			(row) => row.type === 'item' && row.item.value === primaryValue
+		);
 
-		if (selectedInFiltered >= 0) {
-			// The selected model is visible in the current filter
-			selectedModelIdx = selectedInFiltered;
+		if (selectedRowIdx >= 0) {
+			selectedModelIdx = selectedRowIdx;
 		} else {
-			// The selected model is not visible, default to first item in filtered list
-			selectedModelIdx = 0;
+			selectedModelIdx = displayRows.findIndex((row) => row.type === 'item');
+			if (selectedModelIdx < 0) selectedModelIdx = 0;
 		}
 
 		// Set the virtual scroll position so the selected item is rendered and centered
@@ -427,6 +557,8 @@
 
 	const selectItem = (item, index: number) => {
 		selectedModelIdx = index;
+		rememberModelUsage(item?.model?.id ?? item?.value ?? '');
+		recentVersion += 1;
 
 		if (values) {
 			if (compareEnabled) {
@@ -885,9 +1017,38 @@
 
 	$: visibleStart = Math.max(0, Math.floor(listScrollTop / ITEM_HEIGHT) - OVERSCAN);
 	$: visibleEnd = Math.min(
-		filteredItems.length,
+		displayRows.length,
 		Math.ceil((listScrollTop + listViewportHeight) / ITEM_HEIGHT) + OVERSCAN
 	);
+
+	const moveSelection = (delta: number) => {
+		if (!displayRows.length) return;
+		let idx = selectedModelIdx;
+		for (let step = 0; step < displayRows.length + 1; step++) {
+			idx += delta;
+			if (idx < 0 || idx >= displayRows.length) break;
+			if (displayRows[idx]?.type === 'item') {
+				selectedModelIdx = idx;
+				break;
+			}
+		}
+		const item = document.querySelector(`[data-arrow-selected="true"]`);
+		item?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+	};
+
+	const activateSelection = () => {
+		const row = displayRows[selectedModelIdx];
+		if (row?.type === 'item') {
+			selectItem(row.item, selectedModelIdx);
+		} else if (row?.type === 'header') {
+			for (let i = selectedModelIdx + 1; i < displayRows.length; i++) {
+				if (displayRows[i]?.type === 'item') {
+					selectItem(displayRows[i].item, i);
+					return;
+				}
+			}
+		}
+	};
 </script>
 
 <ConfirmDialog
@@ -963,27 +1124,39 @@
 								aria-label={$i18n.t('Search In Models')}
 								on:keydown={(e) => {
 									if (e.code === 'Enter') {
-										if (selectedModelIdx >= filteredItems.length) {
-											const target = downloadTargets[selectedModelIdx - filteredItems.length];
+										if (selectedModelIdx >= displayRows.length) {
+											const target =
+												downloadTargets[selectedModelIdx - displayRows.length];
 											if (target && !target.download) {
 												downloadModelHandler(target);
 											}
-										} else if (filteredItems[selectedModelIdx]) {
-											selectItem(filteredItems[selectedModelIdx], selectedModelIdx);
+										} else {
+											activateSelection();
 										}
 										return; // dont need to scroll on selection
 									} else if (e.code === 'ArrowDown') {
 										e.stopPropagation();
 										selectedModelIdx = Math.min(
 											selectedModelIdx + 1,
-											Math.max(filteredItems.length - 1 + downloadTargets.length, 0)
+											Math.max(displayRows.length - 1 + downloadTargets.length, 0)
 										);
+										const row = displayRows[selectedModelIdx];
+										if (row?.type === 'header') {
+											moveSelection(1);
+										}
 									} else if (e.code === 'ArrowUp') {
 										e.stopPropagation();
 										selectedModelIdx = Math.max(selectedModelIdx - 1, 0);
+										const row = displayRows[selectedModelIdx];
+										if (row?.type === 'header') {
+											moveSelection(-1);
+										}
 									} else {
 										// if the user types something, reset to the top selection.
-										selectedModelIdx = 0;
+										selectedModelIdx = displayRows.findIndex(
+											(row) => row.type === 'item'
+										);
+										if (selectedModelIdx < 0) selectedModelIdx = 0;
 									}
 
 									const item = document.querySelector(`[data-arrow-selected="true"]`);
@@ -995,7 +1168,7 @@
 								}}
 							/>
 
-							{#if modelFilterItems.length > 0 || (multipleEnabled && items.length > 0)}
+							{#if items.length > 0 || modelFilterItems.length > 0 || (multipleEnabled && items.length > 0)}
 								<div class="flex min-w-0 shrink-0 items-center gap-0.5">
 									{#if multipleEnabled && items.length > 0}
 										<Tooltip content={$i18n.t('Compare')}>
@@ -1017,6 +1190,24 @@
 												<Keyframes className="size-3" strokeWidth="2" />
 											</button>
 										</Tooltip>
+									{/if}
+
+									{#if items.length > 0}
+										<TagSelector
+											bind:value={selectedSort}
+											placeholder={$i18n.t('models.sort.default')}
+											align="end"
+											items={sortItems}
+											triggerClass="relative flex h-[1.375rem] max-w-36 items-center gap-0.5 rounded-xl bg-transparent px-1.5 text-[0.6875rem] font-normal transition-colors duration-100 {($settings?.highContrastMode ??
+											false)
+												? 'text-gray-700 hover:bg-gray-200 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-gray-100'
+												: 'text-gray-500 hover:bg-gray-50/40 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-100'}"
+											itemClass="flex h-[1.6875rem] w-full cursor-pointer items-center gap-2 rounded-xl bg-transparent px-2 text-[0.8125rem] {($settings?.highContrastMode ??
+											false)
+												? 'hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-800 dark:hover:text-gray-100'
+												: 'hover:bg-gray-50/40 hover:text-gray-900 dark:hover:bg-gray-800/40 dark:hover:text-gray-100'}"
+											contentClass="min-w-40 model-selector-child-menu"
+										/>
 									{/if}
 
 									{#if modelFilterItems.length > 0}
@@ -1043,31 +1234,65 @@
 					{/if}
 
 					<div class="group relative flex min-h-0 flex-1 flex-col">
-						{#if filteredItems.length === 0}
-							{#if items.length === 0 && $user?.role === 'admin'}
-								<div
-									class="my-2 flex w-full flex-col items-start justify-center px-4 py-3 text-start"
-								>
+							{#if sortedItems.length === 0}
+								{#if items.length === 0 && $user?.role === 'admin'}
 									<div
-										class="mb-0.5 text-xs font-normal leading-4 text-gray-800 dark:text-gray-100"
+										class="my-2 flex w-full flex-col items-start justify-center px-4 py-3 text-start"
 									>
-										{$i18n.t('No models available')}
+										<div
+											class="mb-0.5 text-xs font-normal leading-4 text-gray-800 dark:text-gray-100"
+										>
+											{$i18n.t('No models available')}
+										</div>
+										<div class="w-full text-[0.6875rem] leading-3.5 text-gray-500 dark:text-gray-400">
+											{$i18n.t('Connect to an AI provider to start chatting')}
+										</div>
+										<button
+											type="button"
+											class="focus-ring mt-3 rounded-lg px-0 py-1 text-[0.6875rem] font-normal leading-none text-gray-600 underline-offset-2 transition-colors duration-100 hover:text-gray-800 hover:underline focus:outline-hidden focus:underline dark:text-gray-300 dark:hover:text-gray-100"
+											on:click={() => {
+												show = false;
+												showSettings.set('admin:connections');
+											}}
+										>
+											{$i18n.t('Manage Connections')}
+										</button>
 									</div>
-									<div class="w-full text-[0.6875rem] leading-3.5 text-gray-500 dark:text-gray-400">
-										{$i18n.t('Connect to an AI provider to start chatting')}
-									</div>
-									<button
-										type="button"
-										class="focus-ring mt-3 rounded-lg px-0 py-1 text-[0.6875rem] font-normal leading-none text-gray-600 underline-offset-2 transition-colors duration-100 hover:text-gray-800 hover:underline focus:outline-hidden focus:underline dark:text-gray-300 dark:hover:text-gray-100"
-										on:click={() => {
-											show = false;
-											showSettings.set('admin:connections');
-										}}
+								{:else if items.length === 0}
+									<div
+										class="my-2 flex w-full flex-col items-start justify-center px-4 py-3 text-start"
 									>
-										{$i18n.t('Manage Connections')}
-									</button>
-								</div>
-							{:else}
+										<div
+											class="mb-0.5 text-xs font-normal leading-4 text-gray-800 dark:text-gray-100"
+										>
+											{$i18n.t('No models available')}
+										</div>
+										<div class="w-full text-[0.6875rem] leading-3.5 text-gray-500 dark:text-gray-400">
+											{$i18n.t('Connect your OpenRouter key to start chatting')}
+										</div>
+										<button
+											type="button"
+											class="focus-ring mt-3 rounded-lg px-0 py-1 text-[0.6875rem] font-normal leading-none text-gray-600 underline-offset-2 transition-colors duration-100 hover:text-gray-800 hover:underline focus:outline-hidden focus:underline dark:text-gray-300 dark:hover:text-gray-100"
+											on:click={() => {
+												show = false;
+												showSettings.set('connections');
+											}}
+										>
+											{$i18n.t('Manage Connections')}
+										</button>
+										<button
+											type="button"
+											class="focus-ring mt-1.5 rounded-lg px-0 py-1 text-[0.6875rem] font-normal leading-none text-gray-600 underline-offset-2 transition-colors duration-100 hover:text-gray-800 hover:underline focus:outline-hidden focus:underline dark:text-gray-300 dark:hover:text-gray-100"
+											on:click={async () => {
+												show = false;
+												showSettings.set(false);
+												await goto('/tutoriais');
+											}}
+										>
+											{$i18n.t('Tutorials')}
+										</button>
+									</div>
+								{:else}
 								<div class="">
 									<div
 										class="flex min-h-8 items-center rounded-xl px-2 text-[0.8125rem] text-gray-700 dark:text-gray-100"
@@ -1090,25 +1315,34 @@
 								}}
 							>
 								<div style="height: {visibleStart * ITEM_HEIGHT}px;" />
-								{#each filteredItems.slice(visibleStart, visibleEnd) as item, i (item.value)}
+								{#each displayRows.slice(visibleStart, visibleEnd) as row, i (row.type === 'header' ? `h-${row.key}-${visibleStart + i}` : row.item.value)}
 									{@const index = visibleStart + i}
-									<ModelItem
-										{selectedModelIdx}
-										{item}
-										{index}
-										value={primaryValue}
-										{pinModelHandler}
-										{unloadModelHandler}
-										{deleteModelHandler}
-										{selectionOnly}
-										{compareEnabled}
-										{selectedValues}
-										onClick={() => {
-											selectItem(item, index);
-										}}
-									/>
+									{#if row.type === 'header'}
+										<div
+											class="flex h-8 w-full select-none items-center px-2 pt-1 text-[0.6875rem] font-medium tracking-wide text-gray-400 uppercase dark:text-gray-500"
+											aria-hidden="true"
+										>
+											{row.label}
+										</div>
+									{:else}
+										<ModelItem
+											{selectedModelIdx}
+											item={row.item}
+											{index}
+											value={primaryValue}
+											{pinModelHandler}
+											{unloadModelHandler}
+											{deleteModelHandler}
+											{selectionOnly}
+											{compareEnabled}
+											{selectedValues}
+											onClick={() => {
+												selectItem(row.item, index);
+											}}
+										/>
+									{/if}
 								{/each}
-								<div style="height: {(filteredItems.length - visibleEnd) * ITEM_HEIGHT}px;" />
+								<div style="height: {Math.max(0, displayRows.length - visibleEnd) * ITEM_HEIGHT}px;" />
 							</div>
 						{/if}
 
@@ -1122,10 +1356,10 @@
 								>
 									<div
 										role="option"
-										aria-selected={selectedModelIdx === filteredItems.length + targetIndex}
-										data-arrow-selected={selectedModelIdx === filteredItems.length + targetIndex}
+										aria-selected={selectedModelIdx === displayRows.length + targetIndex}
+										data-arrow-selected={selectedModelIdx === displayRows.length + targetIndex}
 										class="flex h-8 w-full select-none items-center gap-2 rounded-xl px-2 text-left text-[0.8125rem] font-normal text-gray-700 outline-hidden transition-colors duration-75 dark:text-gray-100 {selectedModelIdx ===
-										filteredItems.length + targetIndex
+										displayRows.length + targetIndex
 											? ($settings?.highContrastMode ?? false)
 												? 'bg-gray-200 dark:bg-gray-800'
 												: 'bg-gray-50/70 dark:bg-gray-800/60'
@@ -1174,13 +1408,13 @@
 									<button
 										type="button"
 										role="option"
-										aria-selected={selectedModelIdx === filteredItems.length + targetIndex}
-										data-arrow-selected={selectedModelIdx === filteredItems.length + targetIndex}
+										aria-selected={selectedModelIdx === displayRows.length + targetIndex}
+										data-arrow-selected={selectedModelIdx === displayRows.length + targetIndex}
 										class="focus-ring flex h-8 w-full cursor-pointer select-none items-center gap-2 rounded-xl px-2 text-left text-[0.8125rem] font-normal text-gray-700 outline-hidden transition-colors duration-75 dark:text-gray-100 {($settings?.highContrastMode ??
 										false)
 											? 'hover:bg-gray-200 dark:hover:bg-gray-800'
 											: 'hover:bg-gray-50/40 dark:hover:bg-gray-800/40'} {selectedModelIdx ===
-										filteredItems.length + targetIndex
+										displayRows.length + targetIndex
 											? ($settings?.highContrastMode ?? false)
 												? 'bg-gray-200 dark:bg-gray-800'
 												: 'bg-gray-50/70 dark:bg-gray-800/60'

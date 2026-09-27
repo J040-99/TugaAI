@@ -1,17 +1,28 @@
 <script lang="ts">
 	import { marked } from 'marked';
 
-	import { getContext, tick } from 'svelte';
+	import { getContext, onMount, tick } from 'svelte';
 	import dayjs from '$lib/dayjs';
 
-	import { mobile, settings, user } from '$lib/stores';
+	import { mobile, modelReliability, refreshModelReliability, settings, user } from '$lib/stores';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import { copyToClipboard, sanitizeResponseContent } from '$lib/utils';
+	import { getModelPrice, getModelLimits, isFreeModel } from '$lib/utils/modelCategories';
+	import {
+		describeModelCapabilities,
+		getModelCapabilityBadges,
+		type ModelModalityCapability
+	} from '$lib/utils/modelCapabilities';
 	import { resolveLocalizedModelDescription } from '$lib/utils/localizedContent';
 	import ArrowUpTray from '$lib/components/icons/ArrowUpTray.svelte';
 	import Check from '$lib/components/icons/Check.svelte';
+	import Photo from '$lib/components/icons/Photo.svelte';
+	import Mic from '$lib/components/icons/Mic.svelte';
+	import Sparkles from '$lib/components/icons/Sparkles.svelte';
+	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
+	import TerminalIcon from '$lib/components/icons/Terminal.svelte';
 	import ModelItemMenu from './ModelItemMenu.svelte';
 	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
 	import { toast } from 'svelte-sonner';
@@ -36,6 +47,13 @@
 
 	$: localizedDescription = resolveLocalizedModelDescription(item.model, $i18n.language);
 
+	// Trust ranking over the last 24h — see backend utils/model_reliability.py.
+	$: reliability = $modelReliability[item?.model?.id ?? item?.value ?? ''];
+
+	onMount(() => {
+		refreshModelReliability();
+	});
+
 	const copyLinkHandler = async (model) => {
 		const baseUrl = window.location.origin;
 		const res = await copyToClipboard(`${baseUrl}/?model=${encodeURIComponent(model.id)}`);
@@ -51,12 +69,45 @@
 
 	let showMenu = false;
 	$: isSelected = compareEnabled ? selectedValues.includes(item.value) : value === item.value;
+	$: price =
+		getModelPrice(item?.model) ??
+		(isFreeModel(item)
+			? {
+					isFree: true,
+					short: 'Grátis',
+					long: 'Grátis · entrada $0 · saída $0 / 1M tokens',
+					inputPerM: 0,
+					outputPerM: 0,
+					inputLabel: '$0',
+					outputLabel: '$0'
+				}
+			: null);
+	$: priceLabel = price?.short ?? null;
+	$: priceTooltip = price?.long ?? '';
+	$: limits = getModelLimits(item?.model);
+	$: capabilityBadges = getModelCapabilityBadges(item?.model);
+	$: capabilitySummary = describeModelCapabilities(item?.model, (k) => $i18n.t(k));
+
+	const badgeIcon = (key: ModelModalityCapability) => {
+		if (key === 'vision' || key === 'image_generation') return 'image';
+		if (key === 'audio_in' || key === 'audio_out') return 'audio';
+		if (key === 'video_in' || key === 'video_out') return 'video';
+		if (key === 'web_search') return 'web';
+		if (key === 'terminal' || key === 'code_interpreter') return 'terminal';
+		return 'image';
+	};
 </script>
 
 <button
 	role="option"
 	aria-selected={isSelected}
-	aria-label={$i18n.t('Select {{modelName}} model', { modelName: item.label })}
+	aria-label={[
+		$i18n.t('Select {{modelName}} model', { modelName: item.label }),
+		priceTooltip || priceLabel || '',
+		capabilitySummary || ''
+	]
+		.filter(Boolean)
+		.join(' — ')}
 	class="focus-ring group/item flex h-8 w-full cursor-pointer select-none items-center rounded-xl px-2 text-left text-[0.8125rem] font-normal text-gray-700 outline-hidden transition-colors duration-75 dark:text-gray-100 {($settings?.highContrastMode ??
 	false)
 		? 'hover:bg-gray-200 dark:hover:bg-gray-800'
@@ -93,8 +144,8 @@
 			</div>
 		{/if} -->
 
-		<div class="flex items-center gap-2 overflow-hidden">
-			<div class="flex items-center min-w-fit">
+		<div class="flex min-w-0 items-center gap-1.5 overflow-hidden">
+			<div class="flex shrink-0 items-center">
 				<Tooltip content={$user?.role === 'admin' ? (item?.value ?? '') : ''} placement="top-start">
 					<img
 						src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${item.model.id}&lang=${$i18n.language}`}
@@ -111,15 +162,135 @@
 				</Tooltip>
 			</div>
 
-			<div class="flex min-w-0 items-center">
-				<Tooltip content={`${item.label} (${item.value})`} placement="top-start">
-					<div class="line-clamp-1">
-						{item.label}
-					</div>
-				</Tooltip>
+			<!-- Name: plain truncate (no Tooltip wrapper — tippy div breaks min-w-0 chain) -->
+			<div class="flex min-w-0 flex-1 items-center overflow-hidden">
+				<div
+					class="w-full truncate leading-tight"
+					title={`${item.label} (${item.value})${limits ? ` · ${limits.long}` : ''}${capabilitySummary ? ` · ${capabilitySummary}` : ''}${priceTooltip ? ` · ${priceTooltip}` : ''}`}
+				>
+					{item.label}
+				</div>
 			</div>
 
-			<div class="flex shrink-0 items-center gap-1.5">
+			<!-- Reliability: trust ranking over the last 24h (dot + score) -->
+			{#if reliability}
+				<div class="flex shrink-0 items-center">
+					<Tooltip
+						content={`${$i18n.t('Reliability')}: ${Math.round(reliability.score * 100)}% · ${reliability.successes}/${reliability.observations} · ${$i18n.t('Last 24 hours')}`}
+						placement="top"
+						className="flex shrink-0"
+					>
+						<span
+							class="flex items-center gap-1 whitespace-nowrap text-[0.6875rem] font-medium tabular-nums {reliability.status ===
+							'available'
+								? 'text-emerald-600 dark:text-emerald-400'
+								: reliability.status === 'busy'
+									? 'text-amber-600 dark:text-amber-400'
+									: 'text-red-500 dark:text-red-400'}"
+							aria-label={`${$i18n.t('Reliability')} ${Math.round(reliability.score * 100)}%`}
+						>
+							<span
+								class="size-1.5 rounded-full {reliability.status === 'available'
+									? 'bg-emerald-500'
+									: reliability.status === 'busy'
+										? 'bg-amber-500'
+										: 'bg-red-500'}"
+							/>
+							{Math.round(reliability.score * 100)}%
+						</span>
+					</Tooltip>
+				</div>
+			{/if}
+
+			<!-- Price: compact, always right of name, never wraps -->
+			{#if priceLabel}
+				<div class="flex shrink-0 items-center">
+					<Tooltip
+						content={priceTooltip || priceLabel}
+						placement="top-end"
+						className="flex shrink-0"
+					>
+						<span
+							class="whitespace-nowrap text-[0.6875rem] font-medium tabular-nums {price?.isFree
+								? 'text-emerald-600 dark:text-emerald-400'
+								: 'text-gray-500 dark:text-gray-400'}"
+						>
+							{#if price?.isFree}
+								{priceLabel}
+							{:else if price && (price.inputLabel || price.outputLabel)}
+								{#if price.inputLabel && price.outputLabel && price.inputLabel !== price.outputLabel}
+									{price.inputLabel}/{price.outputLabel}
+								{:else}
+									{price.inputLabel ?? price.outputLabel}
+								{/if}
+							{:else}
+								{priceLabel}
+							{/if}
+						</span>
+					</Tooltip>
+				</div>
+			{/if}
+
+			<!-- Capabilities: max 2 icons -->
+			{#if capabilityBadges.length > 0}
+				<div class="flex shrink-0 items-center">
+					<Tooltip content={capabilitySummary} placement="top" className="flex shrink-0">
+						<span class="flex items-center gap-0.5" aria-label={capabilitySummary}>
+							{#each capabilityBadges.slice(0, 2) as badge (badge.key)}
+								<span
+									class="flex size-[0.9375rem] items-center justify-center text-gray-400 dark:text-gray-500"
+									title={$i18n.t(badge.labelKey)}
+									aria-label={$i18n.t(badge.labelKey)}
+								>
+									{#if badge.key === 'vision'}
+										<Photo className="size-3" strokeWidth="1.5" />
+									{:else if badge.key === 'audio_in' || badge.key === 'audio_out'}
+										<Mic className="size-3" strokeWidth="1.5" />
+									{:else if badge.key === 'video_in' || badge.key === 'video_out'}
+										<svg
+											xmlns="http://www.w3.org/2000/svg"
+											viewBox="0 0 16 16"
+											fill="currentColor"
+											class="size-3"
+											aria-hidden="true"
+										>
+											<path
+												d="M2 4.75A.75.75 0 0 1 2.75 4h7.5a.75.75 0 0 1 .75.75v6.5a.75.75 0 0 1-.75.75h-7.5a.75.75 0 0 1-.75-.75v-6.5Zm9.22 1.22a.75.75 0 0 1 1.06 0l1.25 1.25a.75.75 0 0 1 0 1.06l-1.25 1.25a.75.75 0 1 1-1.06-1.06l.72-.72.72.72a.75.75 0 1 1-1.06 1.06L11.56 8.72l-.72.72a.75.75 0 1 1-1.06-1.06l.72-.72-.72-.72a.75.75 0 0 1 0-1.06l1.25-1.25Z"
+											/>
+										</svg>
+									{:else if badge.key === 'image_generation'}
+										<Sparkles className="size-3" strokeWidth="1.5" />
+									{:else if badge.key === 'web_search'}
+										<GlobeAlt className="size-3" strokeWidth="1.5" />
+									{:else if badge.key === 'terminal' || badge.key === 'code_interpreter'}
+										<TerminalIcon className="size-3" strokeWidth="1.5" />
+									{/if}
+								</span>
+							{/each}
+							{#if capabilityBadges.length > 2}
+								<span class="text-[0.625rem] text-gray-400 dark:text-gray-500"
+									>+{capabilityBadges.length - 2}</span
+								>
+							{/if}
+						</span>
+					</Tooltip>
+				</div>
+			{/if}
+
+			<!-- Secondary meta: only on hover so the name stays readable (display:none frees space) -->
+			<div class="hidden shrink-0 items-center gap-1.5 group-hover/item:flex">
+				{#if limits}
+					<div class="flex items-center">
+						<Tooltip content={limits.long} placement="top">
+							<span
+								class="whitespace-nowrap text-[0.6875rem] font-normal tabular-nums text-gray-400 dark:text-gray-500"
+							>
+								{limits.short}
+							</span>
+						</Tooltip>
+					</div>
+				{/if}
+
 				{#if item.model.owned_by === 'ollama'}
 					{#if (item.model.ollama?.details?.parameter_size ?? '') !== ''}
 						<div class="flex items-center translate-y-[0.5px]">

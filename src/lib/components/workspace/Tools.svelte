@@ -46,10 +46,10 @@
 	import XMark from '../icons/XMark.svelte';
 	import ImportModal from '../ImportModal.svelte';
 	import ViewSelector from './common/ViewSelector.svelte';
-	import CommunityDiscover from './common/CommunityDiscover.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
 	import ChevronDown from '../icons/ChevronDown.svelte';
 	import ChevronUp from '../icons/ChevronUp.svelte';
+	import WorkspaceEmptyState from './common/WorkspaceEmptyState.svelte';
 
 	let shiftKey = false;
 	let loaded = false;
@@ -622,7 +622,7 @@
 					{/each}
 				</div>
 			</div>
-		{:else}
+		{:else if query || viewOption}
 			<div class="flex w-full flex-col items-center justify-center py-16 pb-24">
 				<div class="max-w-sm text-center text-gray-900 dark:text-gray-100">
 					<div class="mb-1.5 text-sm">{$i18n.t('No tools found')}</div>
@@ -631,16 +631,19 @@
 					</div>
 				</div>
 			</div>
+		{:else}
+			<WorkspaceEmptyState
+				icon="tools"
+				title={$i18n.t('workspace.tools.empty.title')}
+				description={$i18n.t('workspace.tools.empty.description')}
+				hint={$i18n.t('workspace.tools.empty.hint')}
+				actionLabel={$i18n.t('workspace.tools.empty.action')}
+				actionHref="/workspace/tools/create"
+				secondaryLabel={$i18n.t('workspace.common.tutorials')}
+				secondaryHref="/tutoriais"
+			/>
 		{/if}
 	</div>
-
-	{#if $config?.features.enable_community_sharing}
-		<CommunityDiscover
-			href="https://openwebui.com/tools"
-			title={$i18n.t('Discover a tool')}
-			description={$i18n.t('Discover, download, and explore custom tools')}
-		/>
-	{/if}
 
 	<DeleteConfirmDialog
 		bind:show={showDeleteConfirm}
