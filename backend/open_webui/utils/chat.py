@@ -32,6 +32,7 @@ from open_webui.utils.filter import (
     process_filter_functions,
 )
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.misc import error_status_from_payload, friendly_provider_error_message
 from open_webui.utils.models import check_model_access, get_all_models
 from open_webui.utils.payload import convert_payload_openai_to_ollama
 from open_webui.utils.response import (
@@ -125,7 +126,12 @@ async def generate_direct_chat_completion(
             return StreamingResponse(event_generator(), media_type='text/event-stream', background=background)
         else:
             EVENT_QUEUES.pop(channel, None)
-            raise Exception(str(res))
+            # Never raise Exception(str(payload)): that turns the provider JSON
+            # into Python's dict repr ("{'error': {...}}") in the chat bubble.
+            raise HTTPException(
+                status_code=error_status_from_payload(res),
+                detail=friendly_provider_error_message(res),
+            )
     else:
         res = await event_caller(
             {
@@ -140,7 +146,10 @@ async def generate_direct_chat_completion(
         )
 
         if 'error' in res and res['error']:
-            raise Exception(res['error'])
+            raise HTTPException(
+                status_code=error_status_from_payload(res),
+                detail=friendly_provider_error_message(res['error']),
+            )
 
         return res
 

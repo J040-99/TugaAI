@@ -40,6 +40,101 @@ def merge_model_params(base: dict, override: dict) -> dict:
     return params
 
 
+# Friendly messages shown to the user instead of the raw upstream payload.
+# The strings double as i18n keys: they are kept byte-for-byte in sync with
+# FRIENDLY_ERROR_KEYS in src/lib/utils/errorMessages.ts so the frontend
+# localizes them (pt-PT) before display.
+FRIENDLY_RATE_LIMIT_MESSAGE = (
+    'This free model is temporarily rate-limited. Wait a minute and try again, '
+    'pick another free model, or add credits / your own key on OpenRouter.'
+)
+FRIENDLY_MODEL_UNAVAILABLE_MESSAGE = (
+    'The model did not respond. Please try again in a moment, or pick another model.'
+)
+
+_RATE_LIMIT_MARKERS = (
+    'rate limit',
+    'rate-limit',
+    'rate-limited',
+    'too many requests',
+    'upstream_provider_shared_pool',
+    'resourceexhausted',
+)
+
+
+def _friendly_provider_error(status_code, text: str):
+    """Map an upstream failure to a friendly message, or None when unknown.
+
+    Keeps provider internals (metadata, user ids, raw bodies) out of the chat
+    bubble while still letting the frontend recognise a rate limit and show the
+    localized copy.
+    """
+    lowered = (text or '').lower()
+    if status_code == 429 or any(marker in lowered for marker in _RATE_LIMIT_MARKERS):
+        return FRIENDLY_RATE_LIMIT_MESSAGE
+    if status_code in (401, 403, 408, 500, 502, 503, 504) or 'provider returned error' in lowered:
+        return FRIENDLY_MODEL_UNAVAILABLE_MESSAGE
+    return None
+
+
+def error_status_from_payload(payload, default: int | None = 500) -> int | None:
+    """Best-effort HTTP status for an upstream error payload."""
+    if isinstance(payload, dict):
+        for source in (payload.get('error'), payload):
+            if isinstance(source, dict):
+                code = source.get('code')
+                if isinstance(code, int) and 400 <= code < 600:
+                    return code
+                code = source.get('provider_error_code')
+                if isinstance(code, str) and code.isdigit() and 400 <= int(code) < 600:
+                    return int(code)
+    return default
+
+
+def friendly_provider_error_message(payload, status_code: int | None = None) -> str:
+    """Human message for an upstream/provider error payload.
+
+    Prevents Python's dict repr (``{'error': {'message': ...}, 'user_id': ...}``)
+    from reaching the chat bubble: recognisable failures (rate limits, provider
+    outages) map to the friendly i18n keys shared with the frontend, everything
+    else degrades to the nested provider message or to plain JSON.
+    """
+    if isinstance(payload, str):
+        text = payload
+        parsed = None
+        try:
+            parsed = JSONCodec.loads(payload)
+        except Exception:
+            parsed = None
+    else:
+        parsed = payload
+        try:
+            text = JSONCodec.dumps(payload)
+        except Exception:
+            text = str(payload)
+
+    # Only classify by status when one was actually provided or found in the
+    # payload; otherwise rely on the text (a default of "500" would mask the
+    # real message of unknown payloads).
+    code = status_code if status_code is not None else error_status_from_payload(parsed, default=None)
+    friendly = _friendly_provider_error(code, text)
+    if friendly:
+        return friendly
+
+    # Unknown failure: surface the first readable message in the payload.
+    if isinstance(parsed, dict):
+        detail = parsed
+        while isinstance(detail, dict):
+            nested = next((detail[key] for key in ('error', 'message', 'detail') if key in detail), None)
+            if nested is None:
+                break
+            detail = nested
+        if isinstance(detail, str) and detail:
+            return detail
+
+    return text
+
+
 def get_response_error_detail(response: object) -> str:
     status_code = getattr(response, 'status_code', None)
     fallback = f'Provider returned HTTP {status_code}' if status_code else 'Provider returned an error'
@@ -50,7 +145,7 @@ def get_response_error_detail(response: object) -> str:
             body = body.decode('utf-8', 'replace')
         detail = JSONCodec.loads(body)
     except Exception:
-        return fallback
+        return _friendly_provider_error(status_code, fallback) or fallback
 
     while isinstance(detail, dict):
         next_detail = None
@@ -59,10 +154,11 @@ def get_response_error_detail(response: object) -> str:
                 next_detail = detail[key]
                 break
         if next_detail is None:
-            return str(detail)
+            return _friendly_provider_error(status_code, str(detail)) or str(detail)
         detail = next_detail
 
-    return detail if isinstance(detail, str) else str(detail)
+    text = detail if isinstance(detail, str) else str(detail)
+    return _friendly_provider_error(status_code, text) or text
 
 
 def _strip_filter_entry(entry):

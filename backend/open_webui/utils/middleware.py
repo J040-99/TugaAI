@@ -4,6 +4,7 @@ import base64
 import copy
 import html
 import inspect
+import io
 import json
 import logging
 import mimetypes
@@ -1813,6 +1814,51 @@ async def add_file_context(messages: list, chat_id: str, user) -> list:
         if not attached_files:
             continue
 
+        # Drop image file tags whose image_url part was removed by
+        # fit_images_into_budget (batch summarization) — otherwise the model
+        # still "sees" 50 attached images and tries to re-transcribe them.
+        content = message.get('content')
+        live_image_urls: set[str] = set()
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get('type') not in ('image_url', 'input_image'):
+                    continue
+                # Prefer original file URL preserved at conversion time.
+                src = part.get('_source_url')
+                if src:
+                    live_image_urls.add(src)
+                data = part.get('image_url')
+                if isinstance(data, dict):
+                    u = data.get('url') or ''
+                elif isinstance(data, str):
+                    u = data
+                else:
+                    u = ''
+                if u and not u.startswith('data:'):
+                    live_image_urls.add(u)
+
+        def _image_still_attached(file) -> bool:
+            ftype = file.get('type') or ''
+            ctype = str(file.get('content_type') or '')
+            is_image = ftype == 'image' or ctype.startswith('image/')
+            if not is_image:
+                return True
+            if not live_image_urls:
+                # Message has no live image parts — this file was batch-summarized.
+                return False
+            url = file.get('url') or ''
+            if not url:
+                return False
+            if url in live_image_urls:
+                return True
+            # If the message still carries any data: image, keep only files we can't match
+            # when count of image files <= live parts (best effort).
+            return False
+
+        attached_files = [f for f in attached_files if _image_still_attached(f)]
+        if not attached_files:
+            continue
+
         file_tags = [format_file_tag(file) for file in attached_files]
         file_context = '<attached_files>\n' + '\n'.join(file_tags) + '\n</attached_files>\n\n'
 
@@ -2196,7 +2242,9 @@ async def convert_url_images_to_base64(form_data, user=None):
             try:
                 base64_data = await get_image_base64_from_url(image_url, user=user)
                 if base64_data and isinstance(image_url_data, str):
-                    new_content.append({**item, 'image_url': base64_data})
+                    new_part = {**item, 'image_url': base64_data}
+                    new_part['_source_url'] = image_url
+                    new_content.append(new_part)
                 elif base64_data:
                     image_url_payload = {'url': base64_data}
                     if isinstance(image_url_data, dict) and image_url_data.get('detail'):
@@ -2205,6 +2253,7 @@ async def convert_url_images_to_base64(form_data, user=None):
                         {
                             'type': item['type'],
                             'image_url': image_url_payload,
+                            '_source_url': image_url,
                         }
                     )
                 else:
@@ -2215,6 +2264,746 @@ async def convert_url_images_to_base64(form_data, user=None):
 
         message['content'] = new_content
 
+    return form_data
+
+
+# OpenRouter: "Downloaded image content cannot exceed 30MB" (HTTP 413).
+# Images are compressed first; oldest are dropped if still over budget.
+OPENROUTER_IMAGE_BUDGET_BYTES = 25 * 1024 * 1024
+OPENROUTER_IMAGE_BUDGET_FREE_BYTES = 20 * 1024 * 1024
+OPENROUTER_IMAGE_KEEP_RECENT = 4
+OPENROUTER_IMAGE_KEEP_RECENT_FREE = 2
+# Reject any single image larger than this (decoded / download size).
+OPENROUTER_MAX_SINGLE_IMAGE_BYTES = 25 * 1024 * 1024
+# NVIDIA vLLM: "At most 12 image(s) may be provided in one prompt."
+# Other providers are similarly low — cap count and keep the newest images.
+MAX_IMAGES_PER_REQUEST = 12
+
+
+def _is_free_model_id(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    mid = str(model_id).lower()
+    return mid.endswith(':free') or ':free:' in mid
+
+
+def _image_url_from_part(part: dict) -> str:
+    image_url_data = part.get('image_url', {})
+    if isinstance(image_url_data, dict):
+        return image_url_data.get('url') or ''
+    if isinstance(image_url_data, str):
+        return image_url_data
+    return ''
+
+
+def _image_payload_bytes(url: str) -> int:
+    if not url:
+        return 0
+    if url.startswith('data:'):
+        # OpenRouter: "Downloaded image content cannot exceed 30MB" — they count
+        # the DECODED image bytes, not the base64 wire size (~4/3 larger).
+        comma = url.find(',')
+        if comma < 0:
+            return len(url)
+        meta, payload = url[:comma], url[comma + 1 :]
+        if ';base64' in meta:
+            return (len(payload) * 3) // 4
+        return len(payload)
+    # Remote/file URL — unknown until downloaded; assume typical photo size.
+    return 2_300_000
+
+
+def _cap_image_count(form_data, max_images: int = MAX_IMAGES_PER_REQUEST) -> int:
+    """
+    Drop the OLDEST image parts so at most `max_images` remain (newest kept).
+    NVIDIA vLLM rejects prompts with >12 images.
+    Returns the number of images removed.
+    """
+    messages = form_data.get('messages') or []
+    refs: list[tuple[dict, dict]] = []  # (content_list, part) chronological
+    for message in messages:
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get('type') in ('image_url', 'input_image'):
+                refs.append((content, part))
+
+    if len(refs) <= max_images:
+        return 0
+
+    dropped = len(refs) - max_images
+    # refs[0] is oldest — drop from the front, keep the last max_images.
+    for content, part in refs[:dropped]:
+        content[:] = [p for p in content if p is not part]
+
+    log.warning(
+        '_cap_image_count: dropped %d old image(s), kept newest %d (limit %d)',
+        dropped,
+        max_images,
+        max_images,
+    )
+    return dropped
+
+
+def enforce_images_total_budget(
+    form_data,
+    budget_bytes: int | None = None,
+    model_id: str | None = None,
+) -> int:
+    """
+    Cap total image payload in the outgoing LLM request.
+    Conversations with many large images (e.g. 51 × 2.3MB) exceed OpenRouter's 30MB
+    download limit. Drops oldest image parts first; may also drop recent ones if the
+    remaining set still does not fit. Text is always kept.
+    Returns the number of image parts removed.
+    """
+    messages = form_data.get('messages') or []
+    if model_id is None:
+        model_id = form_data.get('model') or (form_data.get('model_item') or {}).get('id')
+
+    # Provider hard cap on image COUNT (NVIDIA vLLM: max 12 per prompt).
+    dropped_count = _cap_image_count(form_data)
+    if dropped_count:
+        messages = form_data.get('messages') or []
+
+    is_free = _is_free_model_id(model_id)
+    if budget_bytes is None:
+        budget_bytes = OPENROUTER_IMAGE_BUDGET_FREE_BYTES if is_free else OPENROUTER_IMAGE_BUDGET_BYTES
+    keep_recent = OPENROUTER_IMAGE_KEEP_RECENT_FREE if is_free else OPENROUTER_IMAGE_KEEP_RECENT
+
+    refs: list[tuple[dict, list, dict, int]] = []  # (message, content_list, part, size)
+
+    for message in messages:
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get('type') not in ('image_url', 'input_image'):
+                continue
+            url = _image_url_from_part(part)
+            size = _image_payload_bytes(url)
+            # A single oversized image can never ship — drop it immediately later.
+            refs.append((message, content, part, size))
+
+    if not refs:
+        return 0
+
+    dropped = 0
+
+    # 1) Drop any single image that alone exceeds the hard per-image cap.
+    remaining: list[tuple[dict, list, dict, int]] = []
+    for message, content, part, size in refs:
+        if size > OPENROUTER_MAX_SINGLE_IMAGE_BYTES or size > budget_bytes:
+            try:
+                content.remove(part)
+                dropped += 1
+            except ValueError:
+                pass
+            continue
+        remaining.append((message, content, part, size))
+
+    total = sum(size for *_, size in remaining)
+    if total <= budget_bytes:
+        if dropped:
+            log.warning(
+                'enforce_images_total_budget: dropped %d oversized image(s) (model=%s)',
+                dropped,
+                model_id,
+            )
+        return dropped
+
+    # 2) Drop oldest first, but allow dropping recent images too if still over budget.
+    #    Always try to keep at least the newest image unless it alone does not fit.
+    order = list(remaining)  # chronological
+    idx = 0
+    while total > budget_bytes and idx < len(order):
+        # Protect the last `keep_recent` only while we still have a chance to fit
+        # by dropping older ones. Once we must touch recent images, do so oldest-first.
+        protected_start = max(0, len(order) - keep_recent)
+        if idx < protected_start:
+            message, content, part, size = order[idx]
+            idx += 1
+        else:
+            # Break protection: drop from the oldest still-kept image.
+            still = [r for r in order if r[3] > 0]
+            if not still:
+                break
+            message, content, part, size = still[0]
+            # Remove from working set
+            order = [r for r in order if r[2] is not part]
+
+        try:
+            content.remove(part)
+        except ValueError:
+            continue
+        total -= size
+        dropped += 1
+
+    # 3) Nuclear: if still over, strip ALL remaining images (keep text).
+    if total > budget_bytes:
+        for message, content, part, size in list(order):
+            try:
+                content.remove(part)
+            except ValueError:
+                continue
+            total -= size
+            dropped += 1
+            if total <= budget_bytes:
+                break
+
+    if dropped:
+        log.warning(
+            'enforce_images_total_budget: dropped %d image(s) from request payload '
+            '(model=%s, free=%s, budget %d MB, remaining ~%d MB) to respect OpenRouter image limit',
+            dropped,
+            model_id,
+            is_free,
+            budget_bytes // (1024 * 1024),
+            max(0, total) // (1024 * 1024),
+        )
+
+    # Clean up messages whose content is now an empty list after image removal.
+    for message in messages:
+        content = message.get('content')
+        if isinstance(content, list) and not content:
+            # Leave empty list — process_messages / provider tolerate it; avoid KeyError.
+            pass
+
+    return dropped
+
+
+def _set_image_url_in_part(part: dict, url: str) -> None:
+    data = part.get('image_url')
+    if isinstance(data, dict):
+        data['url'] = url
+    else:
+        part['image_url'] = url
+
+
+IMAGE_READING_HINT = (
+    '\n\n[Instruções OBRIGATÓRIAS de leitura de imagens] '
+    'Se o contexto contiver blocos tipo "[Imagens … da conversa]" com texto, '
+    'ESSAS imagens JÁ foram processadas — NÃO as retranscrevas. '
+    'Apenas processa imagens ainda em forma de imagem, e só se te pedirem transcrição. '
+    'Se já existe texto suficiente, responde directamente à pergunta do utilizador. '
+    'NÃO comentes a orientação, rotação ou como estás a ler. '
+    'Transcreve UMA página de cada vez, por ordem, sem repetir frases. '
+    'PROIBIDO repetir períodos; se começares a repetir, PARA e passa à seguinte. '
+    'Se não conseguires ler uma página, escreve exatamente "página ilegível" e continua. '
+    'Não inventes texto. Não escrevas raciocínio, explicações ou "Wait/let me" — só o conteúdo pedido.'
+)
+
+
+def _add_image_reading_hints(form_data) -> None:
+    """Append OCR anti-loop guidance to system AND last user message when images are present."""
+    messages = form_data.get('messages') or []
+    has_images = False
+    for message in messages:
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get('type') in ('image_url', 'input_image'):
+                has_images = True
+                break
+        if has_images:
+            break
+    if not has_images:
+        return
+
+    # 1) System prompt
+    system = get_system_message(messages)
+    if system is None:
+        messages.insert(0, {'role': 'system', 'content': IMAGE_READING_HINT.strip()})
+    else:
+        content = system.get('content')
+        if isinstance(content, str):
+            if 'Instruções OBRIGATÓRIAS' not in content:
+                system['content'] = content + IMAGE_READING_HINT
+        elif isinstance(content, list):
+            texts = [
+                p.get('text', '')
+                for p in content
+                if isinstance(p, dict) and p.get('type') == 'text'
+            ]
+            if not any('Instruções OBRIGATÓRIAS' in t for t in texts):
+                content.append({'type': 'text', 'text': IMAGE_READING_HINT.strip()})
+
+    # 2) Last user message — models weight recent user text more heavily.
+    short_note = (
+        '\n\n[Lembrete] Só transcribes. Sem comentários sobre orientação/rotação. '
+        'Sem repetir frases. Sem raciocínio ("Wait…"). '
+        'Inlegível → escreve "página ilegível" e segue para a seguinte.'
+    )
+    for message in reversed(messages):
+        if message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if isinstance(content, str):
+            if '[Lembrete] Só transcribes' not in content:
+                message['content'] = content + short_note
+        elif isinstance(content, list):
+            texts = [
+                p.get('text', '')
+                for p in content
+                if isinstance(p, dict) and p.get('type') == 'text'
+            ]
+            if not any('[Lembrete] Só transcribes' in t for t in texts):
+                # Insert after the first text part (user prompt), before images.
+                insert_at = 0
+                for idx, part in enumerate(content):
+                    if isinstance(part, dict) and part.get('type') == 'text':
+                        insert_at = idx + 1
+                        break
+                content.insert(insert_at, {'type': 'text', 'text': short_note.strip()})
+        break
+
+
+def _improve_text_orientation(img):
+    """
+    EXIF-normalise, then try 0/90/180/270° and keep a rotated variant only if
+    horizontal text-line contrast improves by ≥15% (book pages shot sideways).
+    Returns (image, was_rotated).
+    """
+    try:
+        from PIL import ImageOps
+
+        original = img
+        img = ImageOps.exif_transpose(img) or img
+        transposed = img is not original and img.size != original.size
+
+        import numpy as np
+
+        def line_score(im) -> float:
+            g = im.convert('L')
+            scale = 192 / max(g.size, 1)
+            if scale < 1:
+                g = g.resize(
+                    (max(8, int(g.width * scale)), max(8, int(g.height * scale))),
+                    Image.Resampling.BILINEAR,
+                )
+            arr = np.asarray(g, dtype=np.float32)
+            if arr.shape[0] < 8:
+                return -1.0
+            proj = arr.mean(axis=1)
+            diff = np.diff(proj)
+            if diff.size == 0:
+                return -1.0
+            return float(np.std(diff))
+
+        base_score = line_score(img)
+        best_angle = 0
+        best_score = base_score
+        for angle in (90, 180, 270):
+            cand = img.rotate(angle, expand=True, fillcolor=(255, 255, 255))
+            s = line_score(cand)
+            if s > best_score * 1.15:
+                best_score = s
+                best_angle = angle
+        if best_angle:
+            img = img.rotate(best_angle, expand=True, fillcolor=(255, 255, 255))
+            return img, True
+        return img, transposed
+    except Exception as e:
+        log.debug('_improve_text_orientation skipped: %s', e)
+        return img, False
+
+
+def _compress_data_image_url(data_url: str, max_bytes: int) -> tuple[str, bool]:
+    """Orient + shrink a data:image URL to fit max_bytes (JPEG). Returns (url, was_compressed)."""
+    if not isinstance(data_url, str) or not data_url.startswith('data:image'):
+        return data_url, False
+    try:
+        from PIL import Image, ImageOps
+
+        header, sep, b64 = data_url.partition(',')
+        if not sep:
+            return data_url, False
+        raw = base64.b64decode(b64)
+
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img) or img
+        img, rotated = _improve_text_orientation(img)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+
+        over = len(raw) > max_bytes
+        if not over and not rotated:
+            return data_url, False
+
+        if not over:
+            # Only re-encode for orientation — keep quality high for text.
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=92, optimize=True)
+            out = base64.b64encode(buf.getvalue()).decode('ascii')
+            return f'data:image/jpeg;base64,{out}', True
+
+        # Over budget: gentle scale first, then quality — preserve print detail.
+        scale = 1.0
+        quality = 90
+        best_bytes = b''
+        for _ in range(10):
+            width = max(1, int(img.width * scale))
+            height = max(1, int(img.height * scale))
+            resized = (
+                img if (width, height) == img.size else img.resize((width, height), Image.Resampling.LANCZOS)
+            )
+            buf = io.BytesIO()
+            resized.save(buf, format='JPEG', quality=quality, optimize=True)
+            best_bytes = buf.getvalue()
+            if len(best_bytes) <= max_bytes:
+                break
+            scale *= 0.82
+            if scale < 0.5:
+                quality = max(55, quality - 10)
+        else:
+            if len(best_bytes) <= max_bytes:
+                out = base64.b64encode(best_bytes).decode('ascii')
+                return f'data:image/jpeg;base64,{out}', True
+            # Keep the smallest we got even if slightly over — better than dropping.
+        out = base64.b64encode(best_bytes).decode('ascii')
+        return f'data:image/jpeg;base64,{out}', True
+    except Exception as e:
+        log.debug('compress_data_image_url failed: %s', e)
+        return data_url, False
+
+
+def _extract_response_text(response: Any) -> str:
+    if isinstance(response, list) and len(response) == 1:
+        response = response[0]
+    if isinstance(response, JSONResponse):
+        try:
+            response = JSONCodec.loads(response.body.decode('utf-8', 'replace'))
+        except Exception:
+            return ''
+    if not isinstance(response, dict):
+        return ''
+    choices = response.get('choices') or []
+    if choices:
+        message = choices[0].get('message') or {}
+        return message.get('content') or message.get('reasoning_content') or ''
+    parts = []
+    for item in response.get('output') or []:
+        for content in item.get('content') or []:
+            if isinstance(content, dict):
+                parts.append(content.get('text') or content.get('content') or '')
+    return '\n'.join(part for part in parts if part)
+
+
+IMAGE_BATCH_SIZE = 5
+# Parallel sub-agents; NVIDIA vLLM caps workers at 16 — stay well under with
+# other concurrent users too.
+IMAGE_SUBAGENT_CONCURRENCY = 2
+MAX_IMAGE_SUBAGENT_BATCHES = 16  # 16 × 5 = 80 images max via sub-agents
+
+
+async def _run_image_subagent(
+    request,
+    user,
+    model_id: str,
+    batch_parts: list[dict],
+    batch_idx: int,
+    total_batches: int,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    """
+    One sub-agent: non-streaming call that transcribes up to IMAGE_BATCH_SIZE images.
+    Must not touch the client socket (session_id stripped from request.state.metadata).
+    """
+    prompt = (
+        f'Lote {batch_idx + 1} de {total_batches} ({len(batch_parts)} imagens). '
+        'Transcreve TODO o texto visível de cada imagem, uma de cada vez, por ordem. '
+        'Sem repetir frases, sem comentários, sem raciocínio. '
+        'Se uma imagem for inlegível, escreve apenas "página ilegível" e continua. '
+        'Só o texto transcrito, sem intro.'
+    )
+    payload = {
+        'model': model_id,
+        'stream': False,
+        'messages': [
+            {
+                'role': 'user',
+                'content': [{'type': 'text', 'text': prompt}, *batch_parts],
+            }
+        ],
+        'metadata': {'task': 'image_batch'},
+    }
+
+    saved_state_metadata = None
+    if hasattr(request.state, 'metadata'):
+        saved_state_metadata = dict(request.state.metadata or {})
+        request.state.metadata = {
+            k: v
+            for k, v in saved_state_metadata.items()
+            if k not in ('session_id', 'socket_id', 'sid')
+        }
+
+    try:
+        async with semaphore:
+            response = await generate_chat_completion(
+                request, form_data=payload, user=user, bypass_filter=True
+            )
+            return (_extract_response_text(response) or '').strip()
+    except Exception:
+        log.exception(
+            'image sub-agent batch %d/%d failed', batch_idx + 1, total_batches
+        )
+        return ''
+    finally:
+        if saved_state_metadata is not None:
+            request.state.metadata = saved_state_metadata
+
+
+async def fit_images_into_budget(
+    request,
+    user,
+    form_data,
+    budget_bytes: int | None = None,
+    model_id: str | None = None,
+    event_emitter=None,
+) -> dict:
+    """
+    Fit images into OpenRouter/vLLM limits WITHOUT dropping history photos:
+      1) Orient + compress data-URL images.
+      2) If still over count (12) or byte budget → split overflow into batches
+         of 5 and process them with parallel sub-agent model calls (text summary).
+      3) Keep the most recent images as real image parts for the main request.
+      4) Last-resort: drop oldest if sub-agents fail or still over budget.
+    """
+    messages = form_data.get('messages') or []
+    if model_id is None:
+        model_id = form_data.get('model') or (form_data.get('model_item') or {}).get('id')
+
+    is_free = _is_free_model_id(model_id)
+    if budget_bytes is None:
+        budget_bytes = OPENROUTER_IMAGE_BUDGET_FREE_BYTES if is_free else OPENROUTER_IMAGE_BUDGET_BYTES
+
+    def collect_refs() -> list[tuple[dict, list, dict]]:
+        found: list[tuple[dict, list, dict]] = []
+        for message in form_data.get('messages') or []:
+            content = message.get('content')
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get('type') in ('image_url', 'input_image'):
+                    found.append((message, content, part))
+        return found
+
+    refs = collect_refs()
+    if not refs:
+        return form_data
+
+    def payload_total(items: list[tuple[dict, list, dict]] | None = None) -> int:
+        use = refs if items is None else items
+        return sum(_image_payload_bytes(_image_url_from_part(p)) for _, _, p in use)
+
+    # ── 1) Compress data-URL images to a fair share ─────────────────────────
+    # PIL/numpy are CPU-bound — run in a thread so the ASGI event loop keeps
+    # serving Socket.IO pings (blocking here caused "Client session disconnected").
+    count = len(refs)
+    fair_share = max(128 * 1024, min(budget_bytes // max(count, 1), 1_500_000))
+    compressed = 0
+    for _, _, part in refs:
+        url = _image_url_from_part(part)
+        if not url.startswith('data:image'):
+            continue
+        new_url, did = await asyncio.to_thread(_compress_data_image_url, url, fair_share)
+        if did:
+            _set_image_url_in_part(part, new_url)
+            compressed += 1
+
+    total = payload_total()
+    fits_count = count <= MAX_IMAGES_PER_REQUEST
+    fits_bytes = total <= budget_bytes
+    if fits_count and fits_bytes:
+        if compressed:
+            log.info(
+                'fit_images_into_budget: compressed %d/%d image(s), payload ~%d MB <= budget %d MB',
+                compressed,
+                count,
+                total // (1024 * 1024),
+                budget_bytes // (1024 * 1024),
+            )
+        return form_data
+
+    # ── 2) Second compression pass ───────────────────────────────────────────
+    fair_share = max(96 * 1024, min((budget_bytes * 9) // (10 * max(count, 1)), 900 * 1024))
+    for _, _, part in refs:
+        url = _image_url_from_part(part)
+        if not url.startswith('data:image'):
+            continue
+        new_url, did = await asyncio.to_thread(_compress_data_image_url, url, fair_share)
+        if did:
+            _set_image_url_in_part(part, new_url)
+            compressed += 1
+
+    total = payload_total()
+    fits_count = count <= MAX_IMAGES_PER_REQUEST
+    fits_bytes = total <= budget_bytes
+    if fits_count and fits_bytes:
+        log.info(
+            'fit_images_into_budget: 2nd pass compressed to ~%d MB / %d images',
+            total // (1024 * 1024),
+            count,
+        )
+        return form_data
+
+    # ── 3) Sub-agents: batches of 5 for overflow; keep recent as real images ─
+    # Keep budget for recent images: ~1/4 of total, few enough that the main
+    # model does not re-transcribe a dozen pages when sub-agent summaries exist.
+    keep_budget = max(2 * 1024 * 1024, budget_bytes // 4)
+    keep_count_max = 4
+    kept: list[tuple[dict, list, dict]] = []
+    kept_bytes = 0
+    for ref in reversed(refs):  # newest first
+        size = _image_payload_bytes(_image_url_from_part(ref[2]))
+        if len(kept) >= keep_count_max:
+            break
+        if kept_bytes + size > keep_budget:
+            continue
+        kept.append(ref)
+        kept_bytes += size
+
+    kept_ids = {id(p) for _, _, p in kept}
+    overflow = [r for r in refs if id(r[2]) not in kept_ids]
+
+    if not overflow:
+        # Only kept images but still over — last-resort drop.
+        enforce_images_total_budget(form_data, budget_bytes=budget_bytes, model_id=model_id)
+        return form_data
+
+    # Chronological batches of IMAGE_BATCH_SIZE (oldest first).
+    batches: list[list[dict]] = []
+    for i in range(0, len(overflow), IMAGE_BATCH_SIZE):
+        chunk = [part for _, _, part in overflow[i : i + IMAGE_BATCH_SIZE]]
+        batches.append(chunk)
+    if len(batches) > MAX_IMAGE_SUBAGENT_BATCHES:
+        excess_parts = [p for chunk in batches[MAX_IMAGE_SUBAGENT_BATCHES:] for p in chunk]
+        batches = batches[:MAX_IMAGE_SUBAGENT_BATCHES]
+        excess_ids = {id(p) for p in excess_parts}
+        for _m, content, part in overflow:
+            if id(part) in excess_ids:
+                content[:] = [p for p in content if p is not part]
+        log.warning(
+            'fit_images_into_budget: capped at %d batches; %d excess image(s) dropped',
+            MAX_IMAGE_SUBAGENT_BATCHES,
+            len(excess_parts),
+        )
+
+    total_batches = len(batches)
+    log.info(
+        'fit_images_into_budget: %d image(s) over limits — running %d sub-agent batch(es) of ≤%d, keeping %d recent image(s)',
+        len(overflow),
+        total_batches,
+        IMAGE_BATCH_SIZE,
+        len(kept),
+    )
+
+    if event_emitter:
+        try:
+            await event_emitter(
+                {
+                    'type': 'status',
+                    'data': {
+                        'action': 'image_batch',
+                        'description': f'A processar {len(overflow)} imagens em {total_batches} lotes de até {IMAGE_BATCH_SIZE}…',
+                        'done': False,
+                    },
+                }
+            )
+        except Exception:
+            log.debug('image_batch status emit failed')
+
+    semaphore = asyncio.Semaphore(IMAGE_SUBAGENT_CONCURRENCY)
+    done_count = 0
+
+    async def _run_one(idx: int, chunk: list[dict]) -> tuple[int, str]:
+        summary = await _run_image_subagent(
+            request, user, model_id, chunk, idx + 1, total_batches, semaphore
+        )
+        # Keep-alive: progress after every batch so the socket stays warm
+        # and the user sees movement during long runs.
+        if event_emitter:
+            try:
+                await event_emitter(
+                    {
+                        'type': 'status',
+                        'data': {
+                            'action': 'image_batch',
+                            'description': f'Imagens: lote {idx + 1}/{total_batches} concluído',
+                            'done': idx + 1 >= total_batches,
+                        },
+                    }
+                )
+            except Exception:
+                log.debug('image_batch keep-alive emit failed')
+        return idx, summary
+
+    task_list = [
+        asyncio.create_task(_run_one(idx, chunk)) for idx, chunk in enumerate(batches)
+    ]
+    results: list[str] = [''] * total_batches
+    for fut in asyncio.as_completed(task_list):
+        idx, summary = await fut
+        results[idx] = summary
+        done_count += 1
+
+    # Map summaries back: group by content list (message) in chronological order.
+    summaries_by_content: dict[int, list[str]] = {}
+    for idx, (batch_parts, summary) in enumerate(zip(batches, results)):
+        if not summary:
+            continue
+        block = f'[Imagens {idx * IMAGE_BATCH_SIZE + 1}–{idx * IMAGE_BATCH_SIZE + len(batch_parts)} da conversa]\n{summary}'
+        for message in messages:
+            content = message.get('content')
+            if not isinstance(content, list):
+                continue
+            if any(any(part is bp for bp in batch_parts) for part in content if isinstance(part, dict)):
+                summaries_by_content.setdefault(id(content), []).append(block)
+
+    # Remove processed image parts (identity-safe) and insert summaries.
+    for batch_parts in batches:
+        for part in batch_parts:
+            for message in messages:
+                content = message.get('content')
+                if not isinstance(content, list):
+                    continue
+                if any(p is part for p in content):
+                    content[:] = [p for p in content if p is not part]
+                    break
+
+    for message in messages:
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        blocks = summaries_by_content.get(id(content))
+        if not blocks:
+            continue
+        text_part = {'type': 'text', 'text': '\n\n'.join(blocks)}
+        insert_at = 0
+        for i, part in enumerate(content):
+            if isinstance(part, dict) and part.get('type') == 'text':
+                insert_at = i + 1
+        content.insert(insert_at, text_part)
+
+    if event_emitter:
+        try:
+            await event_emitter(
+                {
+                    'type': 'status',
+                    'data': {
+                        'action': 'image_batch',
+                        'description': 'Imagens processadas por sub-agentes',
+                        'done': True,
+                    },
+                }
+            )
+        except Exception:
+            log.debug('image_batch status emit failed')
+
+    # ── 4) Safety net ────────────────────────────────────────────────────────
+    enforce_images_total_budget(form_data, budget_bytes=budget_bytes, model_id=model_id)
     return form_data
 
 
@@ -2478,6 +3267,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 # Strip files field — it's been incorporated into content
                 message.pop('files', None)
 
+            # Do NOT cap image count here — fit_images_into_budget will
+            # summarize overflow via 5-image sub-agent batches first,
+            # then cap the main request (NVIDIA vLLM: max 12 per prompt).
+
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
 
@@ -2536,9 +3329,25 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             pass
 
     form_data = await convert_url_images_to_base64(form_data, user=user)
-
+    # Event emitter first so image sub-agent batches can report progress.
     event_emitter = await get_event_emitter(metadata)
     event_caller = await get_event_call(metadata)
+
+    # Compress + sub-agent batches for overflow (5 images per sub-agent).
+    # Never let image preprocessing kill the whole chat request.
+    try:
+        await fit_images_into_budget(
+            request,
+            user,
+            form_data,
+            model_id=form_data.get('model'),
+            event_emitter=event_emitter,
+        )
+    except Exception:
+        log.exception('fit_images_into_budget failed — continuing without image batching')
+        enforce_images_total_budget(form_data, model_id=form_data.get('model'))
+    # Anti-hallucination hint when the request carries images (avoids OCR loops).
+    _add_image_reading_hints(form_data)
 
     extra_params = {
         '__event_emitter__': event_emitter,
@@ -2590,6 +3399,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if folder and folder.data:
             if 'system_prompt' in folder.data:
                 form_data = await apply_system_prompt_to_body(folder.data['system_prompt'], form_data, metadata, user)
+                # Folder prompt may replace the system message — re-apply image anti-loop hint.
+                _add_image_reading_hints(form_data)
             if 'files' in folder.data:
                 if metadata.get('params', {}).get('function_calling') == 'legacy':
                     form_data['files'] = [
@@ -6281,6 +7092,9 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
 
                         new_form_data = await convert_url_images_to_base64(new_form_data, user=user)
+                        await fit_images_into_budget(
+                            request, user, new_form_data, model_id=new_form_data.get('model')
+                        )
 
                         if filter_functions:
                             new_form_data, _ = await process_filter_functions(

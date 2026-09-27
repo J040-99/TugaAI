@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import re
 from typing import Optional
 from urllib.parse import quote, urlparse
@@ -46,6 +47,7 @@ from open_webui.utils.headers import get_custom_headers, include_user_info_heade
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_logit_bias_input_to_json
 from open_webui.utils.model_ids import strip_provider_model_prefix
+from open_webui.utils.model_reliability import get_ranking, record_success, record_unavailable
 from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
@@ -80,10 +82,194 @@ _MODEL_LIST_TIMEOUT = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_L
 _UNSUPPORTED_OPENAI_MODEL_KEYWORDS = ('babbage', 'dall-e', 'davinci', 'embedding', 'tts', 'whisper')
 BASE_MODELS_CACHE_KEY = f'{REDIS_KEY_PREFIX}:models:base'
 
+# Upstreams that share one pool across users (e.g. OpenRouter's `:free` models)
+# reject chat requests with HTTP 429 before processing them, so replaying the
+# request after a short wait is safe and saves the user a failed turn.
+RATE_LIMIT_MAX_ATTEMPTS = 4  # 1 initial attempt + up to 3 retries
+RATE_LIMIT_RETRY_BASE_DELAY = 1.0  # seconds; doubles on every retry
+RATE_LIMIT_RETRY_MAX_DELAY = 10.0  # seconds
+
+
+def _rate_limit_retry_delay(headers, attempt: int) -> float:
+    """Seconds to wait before replaying a request rejected with HTTP 429.
+
+    Honours the upstream ``Retry-After`` header when present, otherwise uses
+    exponential backoff with jitter so concurrent clients do not retry in
+    lockstep and immediately re-trigger the same limit.
+    """
+    retry_after = None
+    if headers:
+        try:
+            retry_after = float(headers.get('Retry-After', ''))
+        except (TypeError, ValueError):
+            retry_after = None
+
+    if retry_after is not None and retry_after >= 0:
+        return min(RATE_LIMIT_RETRY_MAX_DELAY, retry_after)
+
+    delay = min(RATE_LIMIT_RETRY_MAX_DELAY, RATE_LIMIT_RETRY_BASE_DELAY * (2**attempt))
+    return delay + random.uniform(0, delay / 2)
+
+
+async def _request_with_rate_limit_retry(
+    session,
+    *,
+    url,
+    payload,
+    headers,
+    cookies,
+    timeout,
+    model_id=None,
+):
+    """POST a chat completion, replaying HTTP 429 responses a bounded number of times.
+
+    A rate-limited request is rejected before processing upstream, so no
+    duplicate side effects are possible.
+    """
+    r = None
+    for attempt in range(RATE_LIMIT_MAX_ATTEMPTS):
+        r = await session.request(
+            method='POST',
+            url=url,
+            data=payload,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            timeout=timeout,
+        )
+
+        if r.status != 429 or attempt + 1 >= RATE_LIMIT_MAX_ATTEMPTS:
+            break
+
+        delay = _rate_limit_retry_delay(r.headers, attempt)
+        log.warning(
+            'Provider rate limited the chat completion request (HTTP 429, model %s); retrying in %.1fs (attempt %d/%d)',
+            model_id or '-',
+            delay,
+            attempt + 2,
+            RATE_LIMIT_MAX_ATTEMPTS,
+        )
+        await cleanup_response(r)
+        await asyncio.sleep(delay)
+
+    return r
+
 
 def _clean_proxy_headers(raw_headers) -> dict:
     """Return a copy of *raw_headers* without the encoding, server and date headers."""
     return {k: v for k, v in raw_headers.items() if k.lower() not in _STRIP_PROXY_HEADERS}
+
+
+##########################################
+# OpenRouter `:free` fallback
+#
+# When a free model stays rate limited after the bounded retries above, retry
+# once with a sibling `:free` model from the same provider namespace on the
+# same connection, and prefix the answer with a visible note so the user knows
+# which model actually replied.
+##########################################
+
+FALLBACK_NOTE_PT = (
+    '> **Nota:** este pedido foi respondido por `{fallback}` porque `{original}` '
+    'está temporariamente limitado (rate limit).'
+)
+FALLBACK_NOTE_EN = (
+    '> **Note:** this request was answered by `{fallback}` because `{original}` '
+    'is temporarily rate-limited.'
+)
+
+
+# Statuses meaning "this model cannot answer right now" — worth switching to
+# another model automatically.  Client/auth errors (400/401/403) are excluded:
+# a different model would fail exactly the same way.
+FALLBACK_TRIGGER_STATUSES = (429, 502, 503, 504)
+FALLBACK_MAX_CANDIDATES = 3
+
+
+def list_fallback_models(requested_model: str, models_catalogue: dict) -> list[str]:
+    """Ordered candidates for a model that cannot answer (nearest first).
+
+    Tiers — always restricted to the same connection (same key/limits):
+
+    1. same provider namespace (``google/...``), whatever the pricing tier;
+    2. other ``:free`` models (cheapest option on OpenRouter);
+    3. any other supported model on the same connection.
+
+    Returns [] when the model is unknown to the connection (never guess which
+    key/url would be used) or when there is nothing safe to fall back to.
+    """
+    if not requested_model or '/' not in requested_model or not isinstance(models_catalogue, dict):
+        return []
+
+    requested_info = models_catalogue.get(requested_model)
+    if not isinstance(requested_info, dict):
+        return []
+    requested_url_idx = requested_info.get('urlIdx')
+
+    namespace_prefix = f'{requested_model.split("/", 1)[0]}/'
+    same_namespace: list[str] = []
+    free_models: list[str] = []
+    others: list[str] = []
+
+    for model_id, info in models_catalogue.items():
+        if not isinstance(info, dict) or model_id == requested_model:
+            continue
+        if any(keyword in model_id for keyword in _UNSUPPORTED_OPENAI_MODEL_KEYWORDS):
+            continue
+        if requested_url_idx is not None and info.get('urlIdx') != requested_url_idx:
+            continue
+
+        if model_id.startswith(namespace_prefix):
+            same_namespace.append(model_id)
+        elif model_id.endswith(':free'):
+            free_models.append(model_id)
+        else:
+            others.append(model_id)
+
+    return [*sorted(same_namespace), *sorted(free_models), *sorted(others)][:FALLBACK_MAX_CANDIDATES]
+
+
+def pick_fallback_model(requested_model: str, models_catalogue: dict) -> str | None:
+    """Nearest available model for an unavailable request, or None."""
+    candidates = list_fallback_models(requested_model, models_catalogue)
+    return candidates[0] if candidates else None
+
+
+def build_fallback_note(original_model: str, fallback_model: str, user=None) -> str:
+    language = str(getattr(user, 'language', '') or '').lower()
+    template = FALLBACK_NOTE_PT if language.startswith('pt') else FALLBACK_NOTE_EN
+    return template.format(fallback=fallback_model, original=original_model)
+
+
+def inject_note_into_stream(note: str, stream):
+    """Prefix the first content-bearing SSE delta with a visible note."""
+
+    async def generator():
+        injected = False
+        async for chunk in stream:
+            if not injected:
+                text = chunk.decode('utf-8', 'replace') if isinstance(chunk, bytes) else chunk
+                if isinstance(text, str) and text.startswith('data:'):
+                    raw = text[5:].strip()
+                    if raw and raw != '[DONE]':
+                        try:
+                            event = JSONCodec.loads(raw)
+                        except JSONCodec.JSONDecodeError:
+                            event = None
+
+                        choices = event.get('choices') if isinstance(event, dict) else None
+                        first = choices[0] if isinstance(choices, list) and choices else None
+                        if isinstance(first, dict):
+                            delta = first.get('delta') or {}
+                            content = delta.get('content')
+                            if isinstance(content, str):
+                                delta['content'] = f'{note}\n\n{content}'
+                                first['delta'] = delta
+                                chunk = f'data: {JSONCodec.dumps(event)}\n\n'
+                                injected = True
+            yield chunk
+
+    return generator()
 
 
 async def send_get_request(
@@ -859,6 +1045,17 @@ async def get_all_models(request: Request, user: UserModel) -> dict[str, list]:
 
     request.app.state.OPENAI_MODELS = models
     return {'data': list(models.values())}
+
+
+@router.get('/reliability')
+async def get_model_reliability(user=Depends(get_verified_user)) -> dict:
+    """Model trust ranking.
+
+    How often each model actually answered versus being busy/rate limited
+    (rolling 24h window), best first — so users can see whether their favourite
+    model is reliable today before picking it.
+    """
+    return {'data': get_ranking()}
 
 
 @router.get('/models')
@@ -1648,24 +1845,71 @@ async def generate_chat_completion(
     if not is_streaming_request:
         payload.pop('stream_options', None)
 
-    payload = JSONCodec.dumps(payload)
+    payload_dict = payload
+    payload = JSONCodec.dumps(payload_dict)
 
     r = None
     streaming = False
     response = None
+    fallback_model = None
 
     try:
         session = await get_session()
 
-        r = await session.request(
-            method='POST',
+        # Replay rate-limited requests a bounded number of times before
+        # surfacing the 429 to the user.
+        r = await _request_with_rate_limit_retry(
+            session,
             url=request_url,
-            data=payload,
+            payload=payload,
             headers=headers,
             cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=is_streaming_request),
+            model_id=requested_model,
         )
+
+        # The model cannot answer right now (rate limit / provider outage):
+        # switch automatically to the nearest available model on the same
+        # connection and tell the user which model actually replied.
+        if r.status in FALLBACK_TRIGGER_STATUSES:
+            # This model could not answer — count it against its trust rank.
+            record_unavailable(requested_model)
+            candidates = list_fallback_models(
+                requested_model, getattr(request.app.state, 'OPENAI_MODELS', None) or {}
+            )
+            for candidate in candidates:
+                unavailable_status = r.status
+                await cleanup_response(r)
+                log.warning(
+                    'Model %s unavailable (HTTP %s); switching to fallback model %s',
+                    requested_model,
+                    unavailable_status,
+                    candidate,
+                )
+                r = await _request_with_rate_limit_retry(
+                    session,
+                    url=request_url,
+                    payload=JSONCodec.dumps({**payload_dict, 'model': candidate}),
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=get_client_timeout(stream=is_streaming_request),
+                    model_id=candidate,
+                )
+                if r.status < 400:
+                    fallback_model = candidate
+                    log.info(
+                        'Fallback model %s answered the request (original: %s)',
+                        candidate,
+                        requested_model,
+                    )
+                    break
+
+        # Reliability tracking → model trust ranking (exposed on GET /reliability).
+        if r.status < 400:
+            record_success(fallback_model or requested_model)
+        elif r.status in FALLBACK_TRIGGER_STATUSES:
+            # No candidates, or every candidate failed too.
+            record_unavailable(fallback_model or requested_model)
 
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
@@ -1709,8 +1953,15 @@ async def generate_chat_completion(
                     )
 
             streaming = True
+            body_stream = stream_wrapper(r)
+            if fallback_model:
+                # Visible note: the user must know a different model answered.
+                body_stream = inject_note_into_stream(
+                    build_fallback_note(requested_model, fallback_model, user),
+                    body_stream,
+                )
             return StreamingResponse(
-                stream_wrapper(r),
+                body_stream,
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1740,6 +1991,19 @@ async def generate_chat_completion(
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):
                 response = convert_responses_result(response)
+
+            # Visible note for the non-streaming path (Chat Completions shape).
+            if fallback_model and isinstance(response, dict) and isinstance(response.get('choices'), list):
+                note = build_fallback_note(requested_model, fallback_model, user)
+                try:
+                    choice = response['choices'][0]
+                    message = choice.get('message') or {}
+                    content = message.get('content')
+                    if isinstance(content, str):
+                        message['content'] = f'{note}\n\n{content}'
+                        choice['message'] = message
+                except (IndexError, AttributeError, TypeError):
+                    pass
 
             return response
     except Exception as e:
