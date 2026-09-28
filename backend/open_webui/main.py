@@ -404,6 +404,11 @@ async def lifespan(app: FastAPI):
 
     app.state.scheduler_worker_loop = asyncio.create_task(scheduler_worker_loop(app))
 
+    # Modo cérebro: raciocínio periódico sobre o conhecimento carregado.
+    from open_webui.utils.brain import brain_reflection_loop
+
+    app.state.brain_reflection = asyncio.create_task(brain_reflection_loop(app))
+
     if await Config.get('models.base_models_cache'):
         try:
             await get_all_models(

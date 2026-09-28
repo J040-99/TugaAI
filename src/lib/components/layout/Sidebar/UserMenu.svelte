@@ -387,6 +387,41 @@
 					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
 				>
 					<a
+						href="/brain"
+						draggable="false"
+						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"
+						on:click={async (e) => {
+							if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+							e.preventDefault();
+							show = false;
+							goto('/brain');
+							if ($mobile) {
+								await tick();
+								showSidebar.set(false);
+							}
+						}}
+					>
+						<div class="self-center">
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 16 16"
+								fill="currentColor"
+								class="size-3.5"
+								aria-hidden="true"
+							>
+								<path
+									d="M8 1a2.5 2.5 0 0 0-2.45 2h-.3A2.5 2.5 0 0 0 3 7.5c0 .46.13.89.35 1.26A2.5 2.5 0 0 0 4.5 13.5 2.5 2.5 0 0 0 8 15a2.5 2.5 0 0 0 3.5-1.5 2.5 2.5 0 0 0 1.15-4.74c.22-.37.35-.8.35-1.26A2.5 2.5 0 0 0 10.3 3h-.3A2.5 2.5 0 0 0 8 1Zm-1 4.5a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm3.75.75a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5ZM8 13.5a1 1 0 0 1-1-1v-.25c-.3-.12-.56-.32-.76-.58l.18-.18a.75.75 0 1 0-1.06-1.06l-.18.18c-.26-.2-.46-.46-.58-.76H4.5a1 1 0 1 1 0-2h.25c.12-.3.32-.56.58-.76l-.18-.18a.75.75 0 1 0-1.06-1.06l.18.18c.2-.26.46-.46.76-.58V4.5a1 1 0 1 1 2 0v.25c.3.12.56.32.76.58l.18-.18a.75.75 0 1 0 1.06 1.06l-.18.18c.26.2.46.46.58.76h.25a1 1 0 1 1 0 2h-.25a1.75 1.75 0 0 1-1.34 1.34Z"
+								/>
+							</svg>
+						</div>
+						<div class="self-center truncate">{$i18n.t('Brain')}</div>
+					</a>
+				</div>
+
+				<div
+					class="user-menu-row flex items-center w-full rounded-xl hover:bg-gray-50/60 dark:hover:bg-gray-800/60 transition-colors"
+				>
+					<a
 						href="/spending"
 						draggable="false"
 						class="flex flex-1 min-w-0 h-[1.6875rem] items-center gap-2 rounded-xl px-2 text-[0.8125rem] cursor-pointer select-none"

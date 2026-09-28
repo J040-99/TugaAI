@@ -507,6 +507,39 @@ async def list_files(
 
 
 ############################
+# Brain (Modo Cérebro)
+############################
+
+
+@router.get('/brain/state', response_model=dict)
+async def get_brain_state(user=Depends(get_verified_user)):
+    """Última reflexão periódica do cérebro (stats, índice de memória, insights)."""
+    from open_webui.utils.brain import load_reflection
+
+    return load_reflection()
+
+
+@router.get('/brain', response_model=list[dict])
+async def list_brain_cards(user=Depends(get_verified_user)):
+    """Fichas de memória organizadas pelo cérebro (página /brain)."""
+    from open_webui.utils.brain import build_brain_card
+
+    user_id = None if (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL) else user.id
+    files = await Files.get_files() if user_id is None else await Files.get_files_by_user_id(user_id)
+
+    cards = [build_brain_card(file) for file in files]
+    # Ordena: data declarada primeiro, depois data de criação (mais recente).
+    return sorted(
+        (card for card in cards if card),
+        key=lambda card: (
+            card['brain'].get('date') or '',
+            card.get('created_at') or 0,
+        ),
+        reverse=True,
+    )
+
+
+############################
 # Search Files
 ############################
 

@@ -155,6 +155,35 @@ def parse_brain_payload(raw) -> dict | None:
     }
 
 
+def build_brain_card(file) -> dict | None:
+    """Ficha de memória de um ficheiro (para a página /brain), ou None.
+
+    Não inclui o conteúdo extraído — só os metadados organizados, para a
+    lista ficar leve.
+    """
+    data = getattr(file, 'data', None) or {}
+    brain = data.get('brain') if isinstance(data, dict) else None
+    if not isinstance(brain, dict):
+        return None
+
+    return {
+        'id': file.id,
+        'filename': file.filename,
+        'created_at': file.created_at,
+        'updated_at': file.updated_at,
+        'brain': {
+            'title': brain.get('title') or file.filename,
+            'summary': brain.get('summary') or '',
+            'tags': brain.get('tags') or [],
+            'category': brain.get('category') or 'other',
+            'date': brain.get('date'),
+            'entities': brain.get('entities') or [],
+            'organized_at': brain.get('organized_at'),
+            'model': brain.get('model'),
+        },
+    }
+
+
 async def organize_file(request, file_id: str, user) -> dict | None:
     """Produz a ficha de memória de um ficheiro e grava-a em ``data['brain']``."""
     if not BRAIN_ORGANIZE_ENABLED:
@@ -230,3 +259,325 @@ def schedule_organize(request, file_id: str, user) -> None:
     except RuntimeError:
         # Sem event loop a correr (ex.: contexto de teste) — ignorar.
         log.debug('brain: no running event loop; skipping organisation of %s', file_id)
+
+
+##########################################
+# Raciocínio periódico ("reflexão")
+#
+# De hora a hora (configurável) o cérebro relê tudo o que organizou e produz:
+#   • stats actuais (documentos, pessoas, lugares, categorias, tags)
+#   • um "índice de memória" — o que a IA sabe sobre ti, em parágrafo
+#   • insights — ligações entre documentos (tema, resumo, documentos ligados)
+# O estado fica em DATA_DIR/brain_reflection.json e é servido por
+# GET /api/v1/files/brain/state. Env: BRAIN_REFLECT_INTERVAL (minutos;0=off).
+##########################################
+
+BRAIN_REFLECT_INTERVAL = float(os.getenv('BRAIN_REFLECT_INTERVAL', '60'))
+BRAIN_REFLECT_MIN_CARDS = 2
+BRAIN_REFLECT_MAX_CARDS = 150
+BRAIN_REFLECTION_FILENAME = 'brain_reflection.json'
+BRAIN_REFLECTION_MAX_INSIGHTS = 6
+
+REFLECTION_PROMPT_TEMPLATE = """You are the long-term memory of a personal knowledge base (a "brain").
+Below is the current inventory of organised documents (date | category | title — summary; entities).
+
+Reflect on it and answer with ONLY a single JSON object (no markdown, no commentary):
+
+  "memory_index": 1-3 paragraph description of everything this person's knowledge base is about —
+                  who/what appears often, main themes, timeline. Written in the SAME language as
+                  the documents (Portuguese if they are in Portuguese).
+  "insights":     array of 1 to {max_insights} objects connecting documents that belong together:
+                    {"topic": "short theme", "summary": "1-2 sentences on the connection",
+                     "related": ["exact document titles that connect"]}
+
+Be concrete and useful; never invent documents that are not listed.
+
+Inventory:
+---
+{inventory}
+---
+"""
+
+_reflection_file = None
+
+
+def _reflection_path():
+    global _reflection_file
+    if _reflection_file is None:
+        from open_webui.env import DATA_DIR
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _reflection_file = DATA_DIR / BRAIN_REFLECTION_FILENAME
+    return _reflection_file
+
+
+def load_reflection() -> dict:
+    """Última reflexão persistida (dict vazio se ainda não houver)."""
+    try:
+        with open(str(_reflection_path()), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        log.warning('brain: could not load reflection state', exc_info=True)
+        return {}
+
+
+def save_reflection(state: dict) -> None:
+    """Grava a reflexão de forma atómica; nunca levanta exceção."""
+    try:
+        path = str(_reflection_path())
+        tmp_path = f'{path}.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(state, handle, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        log.warning('brain: could not persist reflection state', exc_info=True)
+
+
+def reflection_stats(cards: list[dict]) -> dict:
+    """Estrutura determinística (sem LLM) a partir das fichas."""
+    categories: dict[str, int] = {}
+    entity_counts: dict[tuple[str, str], int] = {}
+    tag_counts: dict[str, int] = {}
+    people: set[str] = set()
+    places: set[str] = set()
+
+    for card in cards:
+        brain = card.get('brain') or {}
+        category = brain.get('category') or 'other'
+        categories[category] = categories.get(category, 0) + 1
+
+        for entity in brain.get('entities') or []:
+            name, etype = entity.get('name'), entity.get('type')
+            if not name:
+                continue
+            key = (etype or 'topic', name)
+            entity_counts[key] = entity_counts.get(key, 0) + 1
+            if etype == 'person':
+                people.add(name)
+            elif etype == 'place':
+                places.add(name)
+
+        for tag in brain.get('tags') or []:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+    top_entities = sorted(
+        ({'type': t, 'name': n, 'count': c} for (t, n), c in entity_counts.items()),
+        key=lambda item: (-item['count'], item['name']),
+    )
+    top_tags = sorted(
+        ({'name': name, 'count': count} for name, count in tag_counts.items()),
+        key=lambda item: (-item['count'], item['name']),
+    )
+
+    return {
+        'documents': len(cards),
+        'people': len(people),
+        'places': len(places),
+        'tags': len(tag_counts),
+        'categories': dict(sorted(categories.items(), key=lambda kv: -kv[1])),
+        'top_entities': top_entities[:12],
+        'top_tags': top_tags[:20],
+    }
+
+
+def build_reflection_prompt(cards: list[dict]) -> str:
+    """Inventário legível das fichas para o LLM refletir."""
+    lines = []
+    for index, card in enumerate(cards[:BRAIN_REFLECT_MAX_CARDS], start=1):
+        brain = card.get('brain') or {}
+        date = brain.get('date') or '?'
+        title = brain.get('title') or card.get('filename') or 'sem título'
+        summary = (brain.get('summary') or '')[:200]
+        entities = ', '.join(
+            f"{e.get('name')} ({e.get('type', 'topic')})" for e in (brain.get('entities') or [])[:6]
+        )
+        line = f"{index}. {date} | {brain.get('category', 'other')} | {title}"
+        if summary:
+            line += f' — {summary}'
+        if entities:
+            line += f' | {entities}'
+        lines.append(line)
+
+    inventory = '\n'.join(lines) if lines else '(empty)'
+    return REFLECTION_PROMPT_TEMPLATE.replace('{inventory}', inventory).replace(
+        '{max_insights}', str(BRAIN_REFLECTION_MAX_INSIGHTS)
+    )
+
+
+def _normalise_insights(raw_insights) -> list[dict]:
+    """Insights: dicts com tema+resumo, related sem duplicados, máx. N."""
+    insights: list[dict] = []
+    if not isinstance(raw_insights, list):
+        return insights
+    for item in raw_insights[:BRAIN_REFLECTION_MAX_INSIGHTS]:
+        if not isinstance(item, dict):
+            continue
+        topic = _clean_str(str(item.get('topic', '')), 120)
+        summary = _clean_str(str(item.get('summary', '')), 500)
+        if not topic or not summary:
+            continue
+        related: list[str] = []
+        raw_related = item.get('related')
+        if isinstance(raw_related, list):
+            for title in raw_related[:8]:
+                title = _clean_str(str(title), 120)
+                if title and title not in related:
+                    related.append(title)
+        insights.append({'topic': topic, 'summary': summary, 'related': related})
+    return insights
+
+
+def parse_reflection_payload(raw) -> dict | None:
+    """Valida a reflexão do LLM (índice + insights), tolerando ruído."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    text = raw.strip()
+    fenced = re.match(r'^```(?:json)?\s*(.*?)\s*```$', text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    start, end = text.find('{'), text.rfind('}')
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    memory_index = _clean_str(data.get('memory_index'), 4000)
+    insights = _normalise_insights(data.get('insights'))
+
+    if not memory_index and not insights:
+        return None
+    return {'memory_index': memory_index, 'insights': insights}
+
+
+def _reflection_request(app):
+    """Request sintético para poder reutilizar o pipeline normal do chat."""
+    from starlette.requests import Request
+
+    scope = {
+        'type': 'http',
+        'asgi': {'version': '3.0', 'spec_version': '2.3'},
+        'http_version': '1.1',
+        'method': 'POST',
+        'scheme': 'http',
+        'path': '/brain/reflection',
+        'raw_path': b'/brain/reflection',
+        'query_string': b'',
+        'root_path': '',
+        'headers': [],
+        'client': ('127.0.0.1', 0),
+        'server': ('127.0.0.1', 80),
+        'app': app,
+        'state': {},
+    }
+    return Request(scope)
+
+
+async def _brain_system_user():
+    """Primeiro utilizador disponível (admin preferido) para a chamada interna."""
+    try:
+        from open_webui.models.users import Users
+
+        for query in ({'role': 'admin'}, None):
+            result = await (Users.get_users(filter=query, limit=1) if query else Users.get_users(limit=1))
+            if isinstance(result, dict):
+                for value in result.values():
+                    if isinstance(value, list) and value:
+                        return value[0]
+            elif isinstance(result, list) and result:
+                return result[0]
+    except Exception:
+        log.warning('brain: could not load a user for reflection', exc_info=True)
+    return None
+
+
+async def run_reflection(app) -> dict:
+    """Um ciclo de raciocínio: stats → (opcional) insights via LLM → estado."""
+    from open_webui.models.files import Files
+    from open_webui.utils.chat import generate_chat_completion
+
+    files = await Files.get_files()
+    cards = [card for card in (build_brain_card(file) for file in files) if card]
+    cards.sort(
+        key=lambda card: (
+            (card.get('brain') or {}).get('date') or '',
+            card.get('created_at') or 0,
+        ),
+        reverse=True,
+    )
+    cards = cards[:BRAIN_REFLECT_MAX_CARDS]
+
+    stats = reflection_stats(cards)
+    state = {
+        'updated_at': int(time.time()),
+        'stats': stats,
+        'memory_index': '',
+        'insights': [],
+        'model': None,
+    }
+
+    if len(cards) < BRAIN_REFLECT_MIN_CARDS:
+        save_reflection(state)
+        log.info('brain: reflection skipped — only %d card(s)', len(cards))
+        return state
+
+    models = getattr(app.state, 'MODELS', None) or {}
+    model = BRAIN_MODEL or next(iter(models), None)
+    user = await _brain_system_user() if model else None
+
+    if model and user:
+        form_data = {
+            'model': model,
+            'messages': [{'role': 'user', 'content': build_reflection_prompt(cards)}],
+            'stream': False,
+            'temperature': 0.2,
+            'max_tokens': 1100,
+        }
+        try:
+            res = await generate_chat_completion(
+                _reflection_request(app), form_data, user, bypass_filter=True, bypass_system_prompt=True
+            )
+            raw = res['choices'][0]['message']['content']
+            payload = parse_reflection_payload(raw)
+            if payload:
+                state['memory_index'] = payload['memory_index']
+                state['insights'] = payload['insights']
+                state['model'] = model
+        except Exception:
+            log.warning('brain: reflection LLM call failed', exc_info=True)
+    elif not model:
+        log.debug('brain: no model available for reflection')
+
+    save_reflection(state)
+    log.info(
+        'brain: reflection done — %d documents, %d insights',
+        stats['documents'],
+        len(state['insights']),
+    )
+    return state
+
+
+async def brain_reflection_loop(app) -> None:
+    """Loop infinito (arrancado no startup) — nunca morre por uma exceção."""
+    if BRAIN_REFLECT_INTERVAL <= 0:
+        log.info('brain: periodic reflection disabled (BRAIN_REFLECT_INTERVAL=0)')
+        return
+
+    interval = BRAIN_REFLECT_INTERVAL * 60
+    log.info('brain: periodic reflection started — every %.0f minutes', BRAIN_REFLECT_INTERVAL)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await run_reflection(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('brain: reflection cycle failed')
