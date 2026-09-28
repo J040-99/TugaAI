@@ -246,3 +246,41 @@ def test_resolve_model_reads_pydantic_user_settings():
     settings = UserSettings(brain={'organize_model': 'chosen-model'})  # extra='allow'
     user = _FakeUser(settings)
     assert brain.resolve_model(user, 'organize', {'alpha': {}}) == 'chosen-model'
+
+
+def test_direct_provider_matches_model_ids_and_falls_back():
+    from open_webui.utils.brain import direct_provider_for
+
+    settings = {
+        'directConnections': {
+            'OPENAI_API_BASE_URLS': ['https://a.example/v1', 'https://openrouter.ai/api/v1'],
+            'OPENAI_API_KEYS': ['key-a', 'key-b'],
+            'OPENAI_API_CONFIGS': {
+                '0': {'enable': True, 'model_ids': ['outro-modelo']},
+                '1': {'enable': True, 'model_ids': ['google/gemma-4-26b-a4b-it:free']},
+            },
+        }
+    }
+    # Modelo presente na lista explícita da ligação1
+    assert direct_provider_for(settings, 'google/gemma-4-26b-a4b-it:free') == (
+        'https://openrouter.ai/api/v1',
+        'key-b',
+    )
+    # Modelo fora de qualquer lista → primeira ligação ativa (genérico)
+    assert direct_provider_for(settings, 'modelo-desconhecido') == ('https://a.example/v1', 'key-a')
+    # Sem ligações diretas → None (usa o pool global)
+    assert direct_provider_for({}, 'x') is None
+    assert direct_provider_for({'directConnections': {}}, 'x') is None
+
+
+def test_direct_provider_skips_disabled_connections():
+    from open_webui.utils.brain import direct_provider_for
+
+    settings = {
+        'directConnections': {
+            'OPENAI_API_BASE_URLS': ['https://off.example/v1', 'https://on.example/v1'],
+            'OPENAI_API_KEYS': ['k0', 'k1'],
+            'OPENAI_API_CONFIGS': {'0': {'enable': False}, '1': {'enable': True}},
+        }
+    }
+    assert direct_provider_for(settings, 'qualquer') == ('https://on.example/v1', 'k1')

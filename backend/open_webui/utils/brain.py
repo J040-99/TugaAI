@@ -283,7 +283,6 @@ async def organize_file(request, file_id: str, user) -> dict | None:
 
     # Imports tardios: evitam ciclos (utils.chat carrega os routers).
     from open_webui.models.files import Files
-    from open_webui.utils.chat import generate_chat_completion
 
     file = await Files.get_file_by_id(file_id)
     if not file:
@@ -309,17 +308,13 @@ async def organize_file(request, file_id: str, user) -> dict | None:
     }
 
     try:
-        res = await generate_chat_completion(
-            request, form_data, user, bypass_filter=True, bypass_system_prompt=True
-        )
+        raw = await complete_with_provider(request, form_data, user, model)
     except Exception:
         log.warning('brain: LLM call failed for file %s', file_id, exc_info=True)
         return None
 
-    try:
-        raw = res['choices'][0]['message']['content']
-    except (KeyError, IndexError, TypeError):
-        log.warning('brain: unexpected LLM response for file %s: %s', file_id, res)
+    if not isinstance(raw, str) or not raw.strip():
+        log.warning('brain: empty completion for file %s', file_id)
         return None
 
     payload = parse_brain_payload(raw)
@@ -636,7 +631,6 @@ async def _recent_cards(limit: int) -> list[dict]:
 
 async def run_reflection(app) -> dict:
     """Um ciclo de raciocínio: stats → (opcional) insights via LLM → estado."""
-    from open_webui.utils.chat import generate_chat_completion
 
     # Passo 1: stats em streaming — só contadores na memória, nunca as fichas
     # e muito menos o conteúdo dos ficheiros.
@@ -670,10 +664,7 @@ async def run_reflection(app) -> dict:
             'max_tokens': 1100,
         }
         try:
-            res = await generate_chat_completion(
-                _reflection_request(app), form_data, user, bypass_filter=True, bypass_system_prompt=True
-            )
-            raw = res['choices'][0]['message']['content']
+            raw = await complete_with_provider(_reflection_request(app), form_data, user, model)
             payload = parse_reflection_payload(raw)
             if payload:
                 state['memory_index'] = payload['memory_index']
@@ -781,6 +772,99 @@ def resolve_model(user, function: str, models: dict) -> str | None:
         return pick_vision_model(models)
     return BRAIN_MODEL or (next(iter(models), None) if isinstance(models, dict) else None)
 
+
+def _user_settings_dict(user) -> dict:
+    """Settings do utilizador como dict (aceita UserSettings do pydantic)."""
+    settings = getattr(user, 'settings', None)
+    if settings is None:
+        return {}
+    if isinstance(settings, dict):
+        return settings
+    if hasattr(settings, 'model_dump'):
+        return settings.model_dump()
+    return {}
+
+
+def direct_provider_for(settings: dict, model_id: str) -> tuple[str, str] | None:
+    """(base_url, api_key) da LIGAÇÃO DIRETA do cliente que serve ``model_id``.
+
+    Cada cliente guarda o seu provedor em ``settings.directConnections``:
+    ``OPENAI_API_BASE_URLS`` / ``OPENAI_API_KEYS`` / ``OPENAI_API_CONFIGS``
+    (mesmo formato do pool global). Prioriza a ligação cuja lista explícita
+    ``model_ids`` contém o modelo; senão, a primeira ligação ativa.
+    """
+    if not isinstance(settings, dict) or not model_id:
+        return None
+    direct = settings.get('directConnections')
+    if not isinstance(direct, dict):
+        return None
+
+    urls = direct.get('OPENAI_API_BASE_URLS') or []
+    keys = direct.get('OPENAI_API_KEYS') or []
+    configs = direct.get('OPENAI_API_CONFIGS') or {}
+
+    generic = None
+    for index, url in enumerate(urls):
+        if not url:
+            continue
+        config = configs.get(str(index)) or configs.get(index) or {}
+        if config.get('enable') is False:
+            continue
+        key = keys[index] if index < len(keys) else ''
+        model_ids = config.get('model_ids') or []
+        if model_id in model_ids:
+            return (url, key)
+        if generic is None:
+            generic = (url, key)
+    return generic
+
+
+async def _post_chat(base_url: str, api_key: str, payload: dict) -> str | None:
+    """POST direto ao provedor do cliente (sem gate de pool, sem WebSocket)."""
+    import aiohttp
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status >= 400:
+                    body = (await response.text())[:300]
+                    log.warning('brain: provider HTTP %d from %s: %s', response.status, base_url, body)
+                    return None
+                data = await response.json()
+                return data['choices'][0]['message']['content']
+    except Exception:
+        log.warning('brain: direct provider call failed for %s', base_url, exc_info=True)
+        return None
+
+
+async def complete_with_provider(request, form_data: dict, user, model: str) -> str | None:
+    """Completion usando o provedor DO CLIENTE; fallback para o pool global.
+
+    1. ligação direta do cliente (settings.directConnections) → HTTP direto;
+    2. pool global (generate_chat_completion) — pode estar desativado; o
+       chamador trata a exceção/None.
+    Devolve o texto da resposta ou None.
+    """
+    provider = direct_provider_for(_user_settings_dict(user), model)
+    if provider:
+        text = await _post_chat(provider[0], provider[1], form_data)
+        if text is not None:
+            log.info('brain: answered by the client provider %s', provider[0])
+            return text
+
+    from open_webui.utils.chat import generate_chat_completion
+
+    res = await generate_chat_completion(
+        request, form_data, user, bypass_filter=True, bypass_system_prompt=True
+    )
+    return res['choices'][0]['message']['content']
+
 VISION_PROMPT = (
     'Descreve esta imagem em português de Portugal, em 2 a 4 frases, para a '
     'guardar numa base de conhecimento pessoal e a poder pesquisar depois. '
@@ -831,7 +915,6 @@ async def describe_image(request, file_path: str, content_type: str | None, user
         return None
 
     from open_webui.storage.provider import Storage
-    from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
     model = resolve_model(user, 'vision', models)
@@ -861,10 +944,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
     }
 
     try:
-        res = await generate_chat_completion(
-            request, form_data, user, bypass_filter=True, bypass_system_prompt=True
-        )
-        text = res['choices'][0]['message']['content']
+        text = await complete_with_provider(request, form_data, user, model)
     except Exception:
         log.warning('brain: vision description failed for %s', file_path, exc_info=True)
         return None
@@ -931,7 +1011,6 @@ async def describe_pdf(request, file_path: str, content_type: str | None, user) 
         return None
 
     from open_webui.storage.provider import Storage
-    from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
     model = resolve_model(user, 'vision', models)
@@ -956,10 +1035,7 @@ async def describe_pdf(request, file_path: str, content_type: str | None, user) 
     }
 
     try:
-        res = await generate_chat_completion(
-            request, form_data, user, bypass_filter=True, bypass_system_prompt=True
-        )
-        text = res['choices'][0]['message']['content']
+        text = await complete_with_provider(request, form_data, user, model)
     except Exception:
         log.warning('brain: PDF page description failed for %s', file_path, exc_info=True)
         return None
