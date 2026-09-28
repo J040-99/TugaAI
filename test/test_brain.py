@@ -211,3 +211,38 @@ def test_pdf_pages_render_to_data_uris(tmp_path):
 
     # PDF inexistente/corrompido -> lista vazia, nunca excecao
     assert _pdf_page_data_uris(str(tmp_path / 'missing.pdf')) == []
+
+
+class _FakeUser:
+    def __init__(self, settings=None):
+        self.settings = settings
+
+
+def test_resolve_model_prefers_client_choice_per_function():
+    from open_webui.utils import brain
+
+    models = {'alpha': {}, 'beta': {}}
+    user = _FakeUser({'brain': {'organize_model': 'beta', 'vision_model': 'alpha'}})
+
+    assert brain.resolve_model(user, 'organize', models) == 'beta'
+    assert brain.resolve_model(user, 'vision', models) == 'alpha'
+
+
+def test_resolve_model_falls_back_to_global_defaults():
+    from open_webui.utils import brain
+
+    models = {'alpha': {}, 'beta': {}}
+    # Sem escolha do cliente (ou sem utilizador) → default global.
+    assert brain.resolve_model(_FakeUser(None), 'organize', models) == 'alpha'
+    assert brain.resolve_model(None, 'organize', models) == 'alpha'
+    assert brain.resolve_model(None, 'vision', models) == 'alpha'
+    assert brain.resolve_model(None, 'organize', {}) is None
+
+
+def test_resolve_model_reads_pydantic_user_settings():
+    from open_webui.models.users import UserSettings
+    from open_webui.utils import brain
+
+    settings = UserSettings(brain={'organize_model': 'chosen-model'})  # extra='allow'
+    user = _FakeUser(settings)
+    assert brain.resolve_model(user, 'organize', {'alpha': {}}) == 'chosen-model'

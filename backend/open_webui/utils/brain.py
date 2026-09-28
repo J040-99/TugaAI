@@ -295,7 +295,7 @@ async def organize_file(request, file_id: str, user) -> dict | None:
         return None
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = BRAIN_MODEL or next(iter(models), None)
+    model = resolve_model(user, 'organize', models)
     if not model:
         log.warning('brain: no model available to organise file %s', file_id)
         return None
@@ -754,6 +754,33 @@ def pick_vision_model(models: dict) -> str | None:
 
     return next(iter(models), None)
 
+
+def resolve_model(user, function: str, models: dict) -> str | None:
+    """Modelo escolhido pelo CLIENTE para uma função do cérebro.
+
+    Ordem: ``settings.brain.<function>_model`` (por utilizador) → env global
+    (``BRAIN_MODEL`` / ``BRAIN_VISION_MODEL``) → capacidade de visão ou o
+    primeiro da lista.
+
+    Funções: ``organize`` (ficha dos ficheiros) e ``vision`` (imagens + PDFs
+    ilegíveis). A reflexão é global (sem utilizador) e continua a usar o env.
+    """
+    settings = getattr(user, 'settings', None)
+    if settings is None:
+        settings = {}
+    elif not isinstance(settings, dict) and hasattr(settings, 'model_dump'):
+        settings = settings.model_dump()  # UserSettings (pydantic)
+
+    brain_settings = settings.get('brain') if isinstance(settings, dict) else None
+    if isinstance(brain_settings, dict):
+        chosen = brain_settings.get(f'{function}_model')
+        if isinstance(chosen, str) and chosen.strip():
+            return chosen.strip()
+
+    if function == 'vision':
+        return pick_vision_model(models)
+    return BRAIN_MODEL or (next(iter(models), None) if isinstance(models, dict) else None)
+
 VISION_PROMPT = (
     'Descreve esta imagem em português de Portugal, em 2 a 4 frases, para a '
     'guardar numa base de conhecimento pessoal e a poder pesquisar depois. '
@@ -807,7 +834,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
     from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = pick_vision_model(models)
+    model = resolve_model(user, 'vision', models)
     if not model:
         log.debug('brain: no model available to describe images')
         return None
@@ -907,7 +934,7 @@ async def describe_pdf(request, file_path: str, content_type: str | None, user) 
     from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = pick_vision_model(models)
+    model = resolve_model(user, 'vision', models)
     if not model:
         log.debug('brain: no model available to describe PDFs')
         return None
