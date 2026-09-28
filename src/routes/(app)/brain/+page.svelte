@@ -33,30 +33,63 @@
 
 	const authHeaders = () => ({ Authorization: `Bearer ${localStorage.token}` });
 
-	const load = async () => {
-		loading = true;
+	const PAGE_SIZE = 20;
+	let page = 1;
+	let total = 0;
+	let loadingMore = false;
+	let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// O servidor é que filtra e pagina (JSON extract na BD) — o browser só
+	// recebe a página pedida, nunca o volume todo.
+	const loadPage = async (nextPage = 1, append = false) => {
+		if (append) loadingMore = true;
+		else loading = true;
+
 		try {
-			const [cardsRes, stateRes] = await Promise.all([
-				fetch(`${WEBUI_BASE_URL}/api/v1/files/brain`, {
+			const params = new URLSearchParams({
+				page: String(nextPage),
+				limit: String(PAGE_SIZE)
+			});
+			if (query.trim()) params.set('q', query.trim());
+			if (category && category !== 'all') params.set('category', category);
+
+			const cardsRes = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain?${params}`, {
+				headers: authHeaders(),
+				credentials: 'include'
+			});
+			const payload = cardsRes.ok ? await cardsRes.json() : null;
+			const items = Array.isArray(payload) ? payload : (payload?.items ?? []);
+
+			cards = append ? [...cards, ...items] : items;
+			total = Array.isArray(payload) ? items.length : (payload?.total ?? items.length);
+			page = nextPage;
+
+			if (!append && reflection === null) {
+				const stateRes = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/state`, {
 					headers: authHeaders(),
 					credentials: 'include'
-				}),
-				fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/state`, {
-					headers: authHeaders(),
-					credentials: 'include'
-				})
-			]);
-			cards = cardsRes.ok ? await cardsRes.json() : [];
-			reflection = stateRes.ok ? await stateRes.json() : null;
+				});
+				reflection = stateRes.ok ? await stateRes.json() : null;
+			}
 		} catch {
-			cards = [];
-			reflection = null;
+			if (!append) {
+				cards = [];
+				reflection = null;
+			}
 		} finally {
 			loading = false;
+			loadingMore = false;
 		}
 	};
 
-	onMount(load);
+	const scheduleSearch = () => {
+		clearTimeout(searchTimer);
+		searchTimer = setTimeout(() => loadPage(1, false), 300);
+	};
+
+	const loadMore = () => loadPage(page + 1, true);
+
+	onMount(() => loadPage(1, false));
 
 	$: filtered = cards.filter((card) => {
 		const brain = card?.brain ?? {};
@@ -108,7 +141,7 @@
 	})();
 
 	$: stats = {
-		documents: cards.length,
+		documents: total || cards.length,
 		people: entityIndex.filter((e) => e.type === 'person').length,
 		places: entityIndex.filter((e) => e.type === 'place').length,
 		tags: tagIndex.length
@@ -148,6 +181,7 @@
 
 	const toggleTag = (tag: string) => {
 		query = query === tag ? '' : tag;
+		scheduleSearch();
 	};
 </script>
 
@@ -230,6 +264,7 @@
 				<input
 					type="search"
 					bind:value={query}
+					on:input={scheduleSearch}
 					placeholder={$i18n.t('Search memories...')}
 					class="focus-ring w-full rounded-xl border border-gray-200 bg-white px-3.5 py-2 text-sm text-gray-900 outline-hidden placeholder:text-gray-400 dark:border-gray-800 dark:bg-gray-900 dark:text-gray-100"
 				/>
@@ -239,7 +274,10 @@
 						class="rounded-full px-2.5 py-1 text-xs font-medium transition {category === 'all'
 							? 'bg-gray-900 text-white dark:bg-white dark:text-gray-900'
 							: 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'}"
-						on:click={() => (category = 'all')}
+						on:click={() => {
+							category = 'all';
+							loadPage(1, false);
+						}}
 					>
 						{$i18n.t('All')}
 					</button>
@@ -248,7 +286,10 @@
 							class="rounded-full px-2.5 py-1 text-xs font-medium transition {category === cat
 								? 'bg-gray-900 text-white dark:bg-white dark:text-gray-900'
 								: 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'}"
-							on:click={() => (category = cat)}
+							on:click={() => {
+								category = cat;
+								loadPage(1, false);
+							}}
 						>
 							{$i18n.t(cat)}
 						</button>
@@ -399,6 +440,17 @@
 						</div>
 					</div>
 				{/each}
+				{#if cards.length < total}
+					<div class="mt-6 flex justify-center">
+						<button
+							class="rounded-xl border border-gray-200 px-4 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:opacity-60 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
+							disabled={loadingMore}
+							on:click={loadMore}
+						>
+							{loadingMore ? '…' : `${$i18n.t('Load more')} (${cards.length}/${total})`}
+						</button>
+					</div>
+				{/if}
 			{/if}
 		</div>
 	</div>

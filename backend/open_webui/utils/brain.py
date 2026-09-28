@@ -184,6 +184,98 @@ def build_brain_card(file) -> dict | None:
     }
 
 
+async def iter_brain_cards(user_id: str | None = None, page_size: int = 200):
+    """Varre os ficheiros por PÁGINAS e produz só as fichas.
+
+    O conteúdo extraído (o que ocupa memória) é descartado página a página —
+    a diferença entre carregar1M de ficheiros com texto e carregar1M de
+    fichinhas de ~1KB.
+    """
+    from open_webui.models.files import Files
+
+    skip = 0
+    while True:
+        page = await Files.get_file_list(user_id=user_id, skip=skip, limit=page_size)
+        if not page.items:
+            return
+        for file in page.items:
+            card = build_brain_card(file)
+            if card:
+                yield card
+        skip += len(page.items)
+        if page.total is not None and skip >= page.total:
+            return
+
+
+def card_matches(card: dict, q: str = '', category: str = '') -> bool:
+    """Filtro servidor: texto livre (título/resumo/tags/entidades/ficheiro) + categoria."""
+    brain = card.get('brain') or {}
+    cat = (category or '').strip()
+    if cat and cat != 'all' and brain.get('category') != cat:
+        return False
+
+    text = (q or '').strip().lower()
+    if not text:
+        return True
+
+    haystack = ' '.join(
+        part
+        for part in [
+            brain.get('title'),
+            brain.get('summary'),
+            card.get('filename'),
+            ' '.join(brain.get('tags') or []),
+            ' '.join((entity or {}).get('name', '') for entity in brain.get('entities') or []),
+        ]
+        if part
+    ).lower()
+    return text in haystack
+
+
+async def query_brain_cards(
+    user_id: str | None = None,
+    q: str = '',
+    category: str = '',
+    offset: int = 0,
+    limit: int = 200,
+    page_size: int = 200,
+) -> dict:
+    """Janela paginada de fichas com total — nunca retém mais do que a janela.
+
+    Varre por páginas (memória limitada), aplica o filtro servidor a cada ficha
+    e só guarda as fichas da janela pedida. Ordena a janela por data.
+    """
+    matched = 0
+    items: list[dict] = []
+    skip = 0
+
+    from open_webui.models.files import Files
+
+    while True:
+        page = await Files.get_file_list(user_id=user_id, skip=skip, limit=page_size)
+        if not page.items:
+            break
+        for file in page.items:
+            card = build_brain_card(file)
+            if not card or not card_matches(card, q, category):
+                continue
+            if matched >= offset and len(items) < limit:
+                items.append(card)
+            matched += 1
+        skip += len(page.items)
+        if page.total is not None and skip >= page.total:
+            break
+
+    items.sort(
+        key=lambda card: (
+            (card.get('brain') or {}).get('date') or '',
+            card.get('created_at') or 0,
+        ),
+        reverse=True,
+    )
+    return {'items': items, 'total': matched, 'offset': offset, 'limit': limit}
+
+
 async def organize_file(request, file_id: str, user) -> dict | None:
     """Produz a ficha de memória de um ficheiro e grava-a em ``data['brain']``."""
     if not BRAIN_ORGANIZE_ENABLED:
@@ -336,51 +428,67 @@ def save_reflection(state: dict) -> None:
         log.warning('brain: could not persist reflection state', exc_info=True)
 
 
-def reflection_stats(cards: list[dict]) -> dict:
-    """Estrutura determinística (sem LLM) a partir das fichas."""
-    categories: dict[str, int] = {}
-    entity_counts: dict[tuple[str, str], int] = {}
-    tag_counts: dict[str, int] = {}
-    people: set[str] = set()
-    places: set[str] = set()
+def empty_stats() -> dict:
+    """Contadores a zero — pensados para serem actualizados em streaming."""
+    return {
+        'documents': 0,
+        '_people': set(),
+        '_places': set(),
+        '_entities': {},
+        '_tags': {},
+        'categories': {},
+    }
 
-    for card in cards:
-        brain = card.get('brain') or {}
-        category = brain.get('category') or 'other'
-        categories[category] = categories.get(category, 0) + 1
 
-        for entity in brain.get('entities') or []:
-            name, etype = entity.get('name'), entity.get('type')
-            if not name:
-                continue
-            key = (etype or 'topic', name)
-            entity_counts[key] = entity_counts.get(key, 0) + 1
-            if etype == 'person':
-                people.add(name)
-            elif etype == 'place':
-                places.add(name)
+def add_card_to_stats(stats: dict, card: dict) -> None:
+    """Actualiza os contadores com uma ficha (memória constante por *valor*)."""
+    brain = card.get('brain') or {}
+    category = brain.get('category') or 'other'
+    stats['categories'][category] = stats['categories'].get(category, 0) + 1
+    stats['documents'] += 1
 
-        for tag in brain.get('tags') or []:
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    for entity in brain.get('entities') or []:
+        name, etype = entity.get('name'), entity.get('type') or 'topic'
+        if not name:
+            continue
+        key = (etype, name)
+        stats['_entities'][key] = stats['_entities'].get(key, 0) + 1
+        if etype == 'person':
+            stats['_people'].add(name)
+        elif etype == 'place':
+            stats['_places'].add(name)
 
+    for tag in brain.get('tags') or []:
+        stats['_tags'][tag] = stats['_tags'].get(tag, 0) + 1
+
+
+def finalise_stats(stats: dict) -> dict:
+    """Converte os contadores internos na forma pública (listas ordenadas)."""
     top_entities = sorted(
-        ({'type': t, 'name': n, 'count': c} for (t, n), c in entity_counts.items()),
+        ({'type': t, 'name': n, 'count': c} for (t, n), c in stats['_entities'].items()),
         key=lambda item: (-item['count'], item['name']),
     )
     top_tags = sorted(
-        ({'name': name, 'count': count} for name, count in tag_counts.items()),
+        ({'name': name, 'count': count} for name, count in stats['_tags'].items()),
         key=lambda item: (-item['count'], item['name']),
     )
-
     return {
-        'documents': len(cards),
-        'people': len(people),
-        'places': len(places),
-        'tags': len(tag_counts),
-        'categories': dict(sorted(categories.items(), key=lambda kv: -kv[1])),
+        'documents': stats['documents'],
+        'people': len(stats['_people']),
+        'places': len(stats['_places']),
+        'tags': len(stats['_tags']),
+        'categories': dict(sorted(stats['categories'].items(), key=lambda kv: -kv[1])),
         'top_entities': top_entities[:12],
         'top_tags': top_tags[:20],
     }
+
+
+def reflection_stats(cards) -> dict:
+    """Estrutura determinística (sem LLM) a partir das fichas."""
+    stats = empty_stats()
+    for card in cards:
+        add_card_to_stats(stats, card)
+    return finalise_stats(stats)
 
 
 def build_reflection_prompt(cards: list[dict]) -> str:
@@ -499,23 +607,43 @@ async def _brain_system_user():
     return None
 
 
+async def _streaming_stats() -> dict:
+    """Stats de todos os ficheiros com ficha, em memória só de contadores."""
+    stats = empty_stats()
+    async for card in iter_brain_cards():
+        add_card_to_stats(stats, card)
+    return finalise_stats(stats)
+
+
+async def _recent_cards(limit: int) -> list[dict]:
+    """As *limit* fichas mais recentes, com min-heap (memória constante)."""
+    import heapq
+
+    def _sort_key(card: dict):
+        return ((card.get('brain') or {}).get('date') or '', card.get('created_at') or 0)
+
+    heap: list = []
+    sequence = 0
+    async for card in iter_brain_cards():
+        key = _sort_key(card)
+        if len(heap) < limit:
+            heapq.heappush(heap, (key, sequence, card))
+        elif key > heap[0][0]:
+            heapq.heapreplace(heap, (key, sequence, card))
+        sequence += 1
+    return [card for _, _, card in sorted(heap, key=lambda item: item[0], reverse=True)]
+
+
 async def run_reflection(app) -> dict:
     """Um ciclo de raciocínio: stats → (opcional) insights via LLM → estado."""
-    from open_webui.models.files import Files
     from open_webui.utils.chat import generate_chat_completion
 
-    files = await Files.get_files()
-    cards = [card for card in (build_brain_card(file) for file in files) if card]
-    cards.sort(
-        key=lambda card: (
-            (card.get('brain') or {}).get('date') or '',
-            card.get('created_at') or 0,
-        ),
-        reverse=True,
-    )
-    cards = cards[:BRAIN_REFLECT_MAX_CARDS]
+    # Passo 1: stats em streaming — só contadores na memória, nunca as fichas
+    # e muito menos o conteúdo dos ficheiros.
+    stats = await _streaming_stats()
 
-    stats = reflection_stats(cards)
+    # Passo 2: só as BRAIN_REFLECT_MAX_CARDS fichas mais recentes entram no prompt.
+    cards = await _recent_cards(BRAIN_REFLECT_MAX_CARDS)
     state = {
         'updated_at': int(time.time()),
         'stats': stats,

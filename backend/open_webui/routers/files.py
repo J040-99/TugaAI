@@ -20,6 +20,8 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import func, or_, select
+
 from fastapi.responses import FileResponse, StreamingResponse
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STORAGE_LOCAL_CACHE, STORAGE_PROVIDER, UPLOAD_DIR
 from open_webui.constants import ERROR_MESSAGES
@@ -30,6 +32,7 @@ from open_webui.models.channels import Channels
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.files import (
+    File as FileRow,  # SQLAlchemy — NÃO chamar File: isso é o File(...) do FastAPI
     FileForm,
     FileListResponse,
     FileModel,
@@ -511,6 +514,13 @@ async def list_files(
 ############################
 
 
+class BrainListResponse(BaseModel):
+    items: list[dict] = []
+    total: int = 0
+    page: int = 1
+    limit: int = 20
+
+
 @router.get('/brain/state', response_model=dict)
 async def get_brain_state(user=Depends(get_verified_user)):
     """Última reflexão periódica do cérebro (stats, índice de memória, insights)."""
@@ -519,24 +529,62 @@ async def get_brain_state(user=Depends(get_verified_user)):
     return load_reflection()
 
 
-@router.get('/brain', response_model=list[dict])
-async def list_brain_cards(user=Depends(get_verified_user)):
-    """Fichas de memória organizadas pelo cérebro (página /brain)."""
+@router.get('/brain', response_model=BrainListResponse)
+async def list_brain_cards(
+    user=Depends(get_verified_user),
+    page: int = Query(1, ge=1, description='Page number (1-indexed)'),
+    limit: int = Query(20, ge=1, le=100, description='Items per page'),
+    q: str = Query('', description='Search in title and summary'),
+    category: str = Query('all', description='Filter by category'),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Fichas de memória organizadas pelo cérebro — paginadas e pesquisáveis.
+
+    Filtra e pagina DIRECTAMENTE na base de dados (JSON extract): nunca carrega
+    os conteúdos dos ficheiros para a memória — é o que permite crescer para
+    grandes volumes.
+    """
     from open_webui.utils.brain import build_brain_card
 
     user_id = None if (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL) else user.id
-    files = await Files.get_files() if user_id is None else await Files.get_files_by_user_id(user_id)
 
-    cards = [build_brain_card(file) for file in files]
-    # Ordena: data declarada primeiro, depois data de criação (mais recente).
-    return sorted(
-        (card for card in cards if card),
-        key=lambda card: (
-            card['brain'].get('date') or '',
-            card.get('created_at') or 0,
-        ),
-        reverse=True,
+    # Apenas ficheiros com data.brain, filtrados por acesso
+    stmt = select(FileRow).filter(func.json_extract(FileRow.data, '$.brain').isnot(None))
+    if user_id:
+        stmt = stmt.filter(FileRow.user_id == user_id)
+
+    if q.strip():
+        like = f'%{q.strip()}%'
+        stmt = stmt.filter(
+            or_(
+                FileRow.filename.like(like),
+                func.json_extract(FileRow.data, '$.brain.title').like(like),
+                func.json_extract(FileRow.data, '$.brain.summary').like(like),
+                # tags e entidades são arrays JSON — o LIKE encontra texto lá dentro.
+                func.json_extract(FileRow.data, '$.brain.tags').like(like),
+                func.json_extract(FileRow.data, '$.brain.entities').like(like),
+            )
+        )
+
+    if category and category != 'all':
+        stmt = stmt.filter(func.json_extract(FileRow.data, '$.brain.category') == category)
+
+    # Ordenação: data declarada (brain.date), depois created_at
+    stmt = stmt.order_by(
+        func.json_extract(FileRow.data, '$.brain.date').desc().nullslast(),
+        FileRow.created_at.desc(),
     )
+
+    # Contagem total (antes da paginação)
+    total_stmt = select(func.count()).select_from(stmt.subquery())
+    total = (await db.execute(total_stmt)).scalar_one()
+
+    # Página
+    stmt = stmt.offset((page - 1) * limit).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    items = [card for card in (build_brain_card(row) for row in rows) if card]
+    return BrainListResponse(items=items, total=total, page=page, limit=limit)
 
 
 ############################
