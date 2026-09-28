@@ -187,7 +187,39 @@ async def process_uploaded_file(
                         db=db_session,
                     )
                 else:
-                    raise Exception(f'File type {content_type} is not supported for processing')
+                    # Sem motor de OCR: em vez de falhar o upload, o cérebro
+                    # descreve a imagem com um modelo de visão e indexamos a
+                    # descrição — fica pesquisável no Knowledge. Se não houver
+                    # modelo (ou falhar), guardamos como os vídeos.
+                    description = None
+                    try:
+                        from open_webui.utils.brain import describe_image
+
+                        description = await describe_image(request, file_path, content_type, user)
+                    except Exception:
+                        log.exception('brain: image description failed for %s', file_item.id)
+
+                    if description:
+                        log.info(
+                            'Image %s described by vision model; indexing description',
+                            file_item.id,
+                        )
+                        await process_file(
+                            request,
+                            ProcessFileForm(file_id=file_item.id, content=description),
+                            user=user,
+                            db=db_session,
+                        )
+                    else:
+                        log.info(
+                            'Image file detected (%s); storing as-is without text extraction',
+                            content_type,
+                        )
+                        await Files.update_file_data_by_id(
+                            file_item.id,
+                            {'status': 'completed'},
+                            db=db_session,
+                        )
 
             else:
                 # Documents, or media files explicitly enabled for the

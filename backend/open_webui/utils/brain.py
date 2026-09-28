@@ -709,3 +709,112 @@ async def brain_reflection_loop(app) -> None:
             raise
         except Exception:
             log.exception('brain: reflection cycle failed')
+
+
+##########################################
+# Visão — o cérebro descreve imagens
+#
+# Sem motor de OCR configurado, uma imagem não tem texto para indexar.
+# Em vez de a guardar "muda", pedimos a um modelo de visão uma descrição em
+# português — é esse texto que passa a ser pesquisável no Knowledge.
+# Env: BRAIN_VISION_MODEL (default: primeiro modelo disponível)
+##########################################
+
+BRAIN_VISION_MODEL = (os.getenv('BRAIN_VISION_MODEL') or '').strip()
+BRAIN_VISION_MAX_BYTES = 15 * 1024 * 1024
+BRAIN_VISION_MAX_SIDE = 1536
+
+VISION_PROMPT = (
+    'Descreve esta imagem em português de Portugal, em 2 a 4 frases, para a '
+    'guardar numa base de conhecimento pessoal e a poder pesquisar depois. '
+    'Transcreve qualquer texto visível e menciona pessoas, lugares, objetos e '
+    'contexto se os reconheceres. Responde apenas com a descrição, sem '
+    'preâmbulos nem formatação.'
+)
+
+
+def _image_data_uri(path: str, content_type: str | None = None) -> str | None:
+    """Data URI pronto para um modelo de visão (redimensionado e comprimido)."""
+    import base64
+    import io as _io
+
+    from PIL import Image
+
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+
+    if len(raw) > BRAIN_VISION_MAX_BYTES:
+        log.info('brain: image too big for vision (%d bytes); skipping description', len(raw))
+        return None
+
+    try:
+        with Image.open(_io.BytesIO(raw)) as image:
+            image = image.convert('RGB')
+            image.thumbnail((BRAIN_VISION_MAX_SIDE, BRAIN_VISION_MAX_SIDE))
+            buffer = _io.BytesIO()
+            image.save(buffer, format='JPEG', quality=85)
+            encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
+        return f'data:image/jpeg;base64,{encoded}'
+    except Exception:
+        # PIL não conseguiu processar — tenta o original pelo MIME.
+        if not content_type:
+            return None
+        try:
+            return f'data:{content_type};base64,{base64.b64encode(raw).decode("ascii")}'
+        except Exception:
+            return None
+
+
+async def describe_image(request, file_path: str, content_type: str | None, user) -> str | None:
+    """Descrição em texto de uma imagem, via modelo de visão (None se falhar)."""
+    if not BRAIN_ORGANIZE_ENABLED:
+        return None
+
+    from open_webui.storage.provider import Storage
+    from open_webui.utils.chat import generate_chat_completion
+
+    models = getattr(request.app.state, 'MODELS', None) or {}
+    model = BRAIN_VISION_MODEL or next(iter(models), None)
+    if not model:
+        log.debug('brain: no model available to describe images')
+        return None
+
+    resolved = await asyncio.to_thread(Storage.get_file, file_path)
+    data_uri = await asyncio.to_thread(_image_data_uri, resolved, content_type)
+    if not data_uri:
+        return None
+
+    form_data = {
+        'model': model,
+        'messages': [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': VISION_PROMPT},
+                    {'type': 'image_url', 'image_url': {'url': data_uri}},
+                ],
+            }
+        ],
+        'stream': False,
+        'temperature': 0.2,
+        'max_tokens': 600,
+    }
+
+    try:
+        res = await generate_chat_completion(
+            request, form_data, user, bypass_filter=True, bypass_system_prompt=True
+        )
+        text = res['choices'][0]['message']['content']
+    except Exception:
+        log.warning('brain: vision description failed for %s', file_path, exc_info=True)
+        return None
+
+    text = (text or '').strip()
+    if len(text) < 20:
+        return None
+
+    log.info('brain: image described by %s (%d chars)', model, len(text))
+    return text

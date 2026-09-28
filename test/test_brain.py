@@ -169,3 +169,28 @@ def test_reflection_state_roundtrip(tmp_path):
         assert brain.load_reflection() == {}  # nunca levanta exceção
     finally:
         brain._reflection_file = original
+
+
+def test_image_data_uri_downscales_to_jpeg(tmp_path):
+    import io as _io
+
+    from PIL import Image
+
+    from open_webui.utils.brain import _image_data_uri
+
+    png = tmp_path / 'photo.png'
+    Image.new("RGB", (3000, 2000), color=(12, 200, 90)).save(png)
+
+    uri = _image_data_uri(str(png), 'image/png')
+    assert uri is not None
+    assert uri.startswith('data:image/jpeg;base64,')
+
+    # Ficheiro inexistente → None (nunca exceção)
+    assert _image_data_uri(str(tmp_path / 'missing.png'), 'image/png') is None
+
+
+def test_vision_prompt_asks_for_portuguese_plain_text():
+    from open_webui.utils.brain import VISION_PROMPT
+
+    assert 'português' in VISION_PROMPT
+    assert 'preâmbulos' in VISION_PROMPT  # resposta só texto, para indexar
