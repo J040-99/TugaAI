@@ -700,9 +700,17 @@ async def brain_reflection_loop(app) -> None:
         return
 
     interval = BRAIN_REFLECT_INTERVAL * 60
-    log.info('brain: periodic reflection started — every %.0f minutes', BRAIN_REFLECT_INTERVAL)
+    # Primeira reflexão cedo (para não esperar1h por nada), depois ao ritmo.
+    first_delay = min(interval, float(os.getenv('BRAIN_REFLECT_FIRST_DELAY', '60')))
+    log.info(
+        'brain: periodic reflection started — first run in %.0fs, then every %.0f minutes',
+        first_delay,
+        BRAIN_REFLECT_INTERVAL,
+    )
+    delay = first_delay
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
+        delay = interval
         try:
             await run_reflection(app)
         except asyncio.CancelledError:
@@ -723,6 +731,28 @@ async def brain_reflection_loop(app) -> None:
 BRAIN_VISION_MODEL = (os.getenv('BRAIN_VISION_MODEL') or '').strip()
 BRAIN_VISION_MAX_BYTES = 15 * 1024 * 1024
 BRAIN_VISION_MAX_SIDE = 1536
+
+
+def pick_vision_model(models: dict) -> str | None:
+    """Melhor modelo para descrever imagens/PDFs.
+
+    Prioridade: BRAIN_VISION_MODEL (explícito) → primeiro modelo com
+    capacidade de visão nos metadados → primeiro da lista.
+    """
+    if BRAIN_VISION_MODEL:
+        return BRAIN_VISION_MODEL
+    if not isinstance(models, dict) or not models:
+        return None
+
+    for model_id, info in models.items():
+        try:
+            capabilities = (((info or {}).get('info') or {}).get('meta') or {}).get('capabilities') or {}
+        except AttributeError:
+            capabilities = {}
+        if capabilities.get('vision'):
+            return model_id
+
+    return next(iter(models), None)
 
 VISION_PROMPT = (
     'Descreve esta imagem em português de Portugal, em 2 a 4 frases, para a '
@@ -777,7 +807,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
     from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = BRAIN_VISION_MODEL or next(iter(models), None)
+    model = pick_vision_model(models)
     if not model:
         log.debug('brain: no model available to describe images')
         return None
@@ -877,7 +907,7 @@ async def describe_pdf(request, file_path: str, content_type: str | None, user) 
     from open_webui.utils.chat import generate_chat_completion
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = BRAIN_VISION_MODEL or next(iter(models), None)
+    model = pick_vision_model(models)
     if not model:
         log.debug('brain: no model available to describe PDFs')
         return None
