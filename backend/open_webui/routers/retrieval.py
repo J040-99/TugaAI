@@ -62,6 +62,7 @@ from open_webui.env import (
 )
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_db, get_async_session
+from open_webui.utils.brain import schedule_organize
 from open_webui.models.files import FileModel, Files, FileUpdateForm
 from open_webui.models.knowledge import Knowledges
 from open_webui.models.config import Config
@@ -2066,6 +2067,9 @@ async def process_file(
                 {'content': text_content},
                 db=db,
             )
+            # Modo cérebro: organiza o ficheiro em background (título, resumo,
+            # tags, categoria, data, entidades) sem atrasar o processamento.
+            schedule_organize(request, file.id, user)
             hash = calculate_sha256_string(text_content)
 
             if config.BYPASS_EMBEDDING_AND_RETRIEVAL:
