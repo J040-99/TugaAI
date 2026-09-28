@@ -292,15 +292,49 @@ async def process_uploaded_file(
                     raise
 
         except Exception as e:
-            log.error(f'Error processing file: {file_item.id}')
-            await Files.update_file_data_by_id(
-                file_item.id,
-                {
-                    'status': 'failed',
-                    'error': str(e.detail) if hasattr(e, 'detail') else str(e),
-                },
-                db=db_session,
+            error_text = str(e.detail) if hasattr(e, 'detail') else str(e)
+
+            # PDF ilegível (digitalizado/sem texto): em vez de falhar, o
+            # cérebro renderiza as páginas e pede a um modelo de visão que as
+            # descreva — indexamos a descrição como texto.
+            description = None
+            is_pdf = (file_item.filename or '').lower().endswith('.pdf') or (
+                (file.content_type or '').lower() == 'application/pdf'
             )
+            if is_pdf and ERROR_MESSAGES.EMPTY_CONTENT in error_text:
+                try:
+                    from open_webui.utils.brain import describe_pdf
+
+                    description = await describe_pdf(request, file_path, file.content_type, user)
+                except Exception:
+                    log.exception('brain: PDF description failed for %s', file_item.id)
+
+            if description:
+                log.info(
+                    'Unreadable PDF %s described by vision model; indexing description',
+                    file_item.id,
+                )
+                try:
+                    await process_file(
+                        request,
+                        ProcessFileForm(file_id=file_item.id, content=description),
+                        user=user,
+                        db=db_session,
+                    )
+                except Exception:
+                    log.exception('brain: indexing PDF description failed for %s', file_item.id)
+                    description = None
+
+            if not description:
+                log.error(f'Error processing file: {file_item.id}')
+                await Files.update_file_data_by_id(
+                    file_item.id,
+                    {
+                        'status': 'failed',
+                        'error': error_text,
+                    },
+                    db=db_session,
+                )
 
     try:
         if db:

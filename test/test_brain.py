@@ -172,14 +172,12 @@ def test_reflection_state_roundtrip(tmp_path):
 
 
 def test_image_data_uri_downscales_to_jpeg(tmp_path):
-    import io as _io
-
-    from PIL import Image
 
     from open_webui.utils.brain import _image_data_uri
+    from PIL import Image
 
     png = tmp_path / 'photo.png'
-    Image.new("RGB", (3000, 2000), color=(12, 200, 90)).save(png)
+    Image.new('RGB', (3000, 2000), color=(12, 200, 90)).save(png)
 
     uri = _image_data_uri(str(png), 'image/png')
     assert uri is not None
@@ -194,3 +192,22 @@ def test_vision_prompt_asks_for_portuguese_plain_text():
 
     assert 'português' in VISION_PROMPT
     assert 'preâmbulos' in VISION_PROMPT  # resposta só texto, para indexar
+
+
+def test_pdf_pages_render_to_data_uris(tmp_path):
+    import pymupdf
+    from open_webui.utils.brain import _pdf_page_data_uris
+
+    pdf = tmp_path / 'scan.pdf'
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 72), 'Documento de teste')
+    document.save(str(pdf))
+    document.close()
+
+    uris = _pdf_page_data_uris(str(pdf))
+    assert uris, 'devia renderizar a pagina'
+    assert uris[0].startswith('data:image/jpeg;base64,')
+
+    # PDF inexistente/corrompido -> lista vazia, nunca excecao
+    assert _pdf_page_data_uris(str(tmp_path / 'missing.pdf')) == []

@@ -818,3 +818,98 @@ async def describe_image(request, file_path: str, content_type: str | None, user
 
     log.info('brain: image described by %s (%d chars)', model, len(text))
     return text
+
+
+##########################################
+# PDFs ilegíveis — o cérebro lê as páginas
+#
+# Um PDF digitalizado (sem camada de texto) devolve EMPTY_CONTENT e o upload
+# fica 'failed'. Com PyMuPDF renderizamos as primeiras páginas e pedimos ao
+# modelo de visão que descreva o que lá está — indexa-se a descrição.
+# Env: BRAIN_PDF_MAX_PAGES (default3)
+##########################################
+
+BRAIN_PDF_MAX_PAGES = int(os.getenv('BRAIN_PDF_MAX_PAGES', '3'))
+BRAIN_PDF_ZOOM = 1.5  # ~108 dpi — bom equilíbrio entre detalhe e tamanho
+
+PDF_VISION_PROMPT = (
+    'Estas são as primeiras páginas de um PDF que não tem texto extraível '
+    '(provavelmente digitalizado ou só com imagens). Descreve o conteúdo em '
+    'português de Portugal, em 3 a 6 frases, para o guardar numa base de '
+    'conhecimento pessoal: transcreve o texto visível, indica pessoas, lugares, '
+    'temas e o tipo de documento. Responde apenas com a descrição, sem '
+    'preâmbulos nem formatação.'
+)
+
+
+def _pdf_page_data_uris(path: str, max_pages: int = BRAIN_PDF_MAX_PAGES) -> list[str]:
+    """Renderiza as primeiras páginas de um PDF como data URIs JPEG."""
+    import base64
+    import io as _io
+
+    import pymupdf
+    from PIL import Image
+
+    uris: list[str] = []
+    try:
+        with pymupdf.open(path) as document:
+            for index in range(min(max_pages, document.page_count)):
+                page = document.load_page(index)
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(BRAIN_PDF_ZOOM, BRAIN_PDF_ZOOM))
+                with Image.open(_io.BytesIO(pixmap.tobytes('png'))) as image:
+                    image = image.convert('RGB')
+                    buffer = _io.BytesIO()
+                    image.save(buffer, format='JPEG', quality=85)
+                    encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
+                    uris.append(f'data:image/jpeg;base64,{encoded}')
+    except Exception:
+        log.warning('brain: could not render PDF pages of %s', path, exc_info=True)
+        return []
+    return uris
+
+
+async def describe_pdf(request, file_path: str, content_type: str | None, user) -> str | None:
+    """Descrição em texto das primeiras páginas de um PDF ilegível (None se falhar)."""
+    if not BRAIN_ORGANIZE_ENABLED:
+        return None
+
+    from open_webui.storage.provider import Storage
+    from open_webui.utils.chat import generate_chat_completion
+
+    models = getattr(request.app.state, 'MODELS', None) or {}
+    model = BRAIN_VISION_MODEL or next(iter(models), None)
+    if not model:
+        log.debug('brain: no model available to describe PDFs')
+        return None
+
+    resolved = await asyncio.to_thread(Storage.get_file, file_path)
+    uris = await asyncio.to_thread(_pdf_page_data_uris, resolved)
+    if not uris:
+        return None
+
+    content: list[dict] = [{'type': 'text', 'text': PDF_VISION_PROMPT}]
+    content.extend({'type': 'image_url', 'image_url': {'url': uri}} for uri in uris)
+
+    form_data = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': content}],
+        'stream': False,
+        'temperature': 0.2,
+        'max_tokens': 900,
+    }
+
+    try:
+        res = await generate_chat_completion(
+            request, form_data, user, bypass_filter=True, bypass_system_prompt=True
+        )
+        text = res['choices'][0]['message']['content']
+    except Exception:
+        log.warning('brain: PDF page description failed for %s', file_path, exc_info=True)
+        return None
+
+    text = (text or '').strip()
+    if len(text) < 20:
+        return None
+
+    log.info('brain: unreadable PDF described by %s (%d chars, %d page(s))', model, len(text), len(uris))
+    return text
