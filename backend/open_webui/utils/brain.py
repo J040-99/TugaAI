@@ -533,6 +533,21 @@ def save_reflection(state: dict) -> None:
         log.warning('brain: could not persist reflection state', exc_info=True)
 
 
+# Títulos que separavam a mesma pessoa ("Profª Rosa Carranca" = "Rosa Carranca")
+_HONORIFICS = re.compile(
+    r'^(profª|professor|professora|prof|dr\.?|dra?|eng\.?|sr|sra|exmo|exma)[.\s]+',
+    re.I,
+)
+
+
+def _canonical_entity_name(name: str, etype: str) -> str:
+    """Nome canónico para agregar entidades duplicadas nas estatísticas."""
+    cleaned = ' '.join(str(name or '').split())
+    if etype == 'person':
+        cleaned = _HONORIFICS.sub('', cleaned).strip()
+    return cleaned
+
+
 def empty_stats() -> dict:
     """Contadores a zero — pensados para serem actualizados em streaming."""
     return {
@@ -540,37 +555,50 @@ def empty_stats() -> dict:
         '_people': set(),
         '_places': set(),
         '_entities': {},
+        '_entity_display': {},
         '_tags': {},
         'categories': {},
     }
 
 
 def add_card_to_stats(stats: dict, card: dict) -> None:
-    """Actualiza os contadores com uma ficha (memória constante por *valor*)."""
+    """Actualiza os contadores com uma ficha (memória constante por *valor*).
+
+    Agrega entidades equivalentes: pessoas sem títulos ("Profª X" = "X") e
+    comparações sem maiúsculas ("MySQL" = "mysql"); as tags ficam em minúsculas.
+    """
     brain = card.get('brain') or {}
     category = brain.get('category') or 'other'
     stats['categories'][category] = stats['categories'].get(category, 0) + 1
     stats['documents'] += 1
 
     for entity in brain.get('entities') or []:
-        name, etype = entity.get('name'), entity.get('type') or 'topic'
-        if not name:
+        etype = entity.get('type') or 'topic'
+        canonical = _canonical_entity_name(entity.get('name'), etype)
+        if not canonical:
             continue
-        key = (etype, name)
+        key = (etype, canonical.lower())
         stats['_entities'][key] = stats['_entities'].get(key, 0) + 1
+        stats['_entity_display'].setdefault(key, canonical)
         if etype == 'person':
-            stats['_people'].add(name)
+            stats['_people'].add(key[1])
         elif etype == 'place':
-            stats['_places'].add(name)
+            stats['_places'].add(key[1])
 
     for tag in brain.get('tags') or []:
-        stats['_tags'][tag] = stats['_tags'].get(tag, 0) + 1
+        tag = str(tag).strip().lower()
+        if tag:
+            stats['_tags'][tag] = stats['_tags'].get(tag, 0) + 1
 
 
 def finalise_stats(stats: dict) -> dict:
     """Converte os contadores internos na forma pública (listas ordenadas)."""
+    display = stats.get('_entity_display') or {}
     top_entities = sorted(
-        ({'type': t, 'name': n, 'count': c} for (t, n), c in stats['_entities'].items()),
+        (
+            {'type': t, 'name': display.get((t, n), n), 'count': c}
+            for (t, n), c in stats['_entities'].items()
+        ),
         key=lambda item: (-item['count'], item['name']),
     )
     top_tags = sorted(

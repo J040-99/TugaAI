@@ -460,3 +460,36 @@ def test_garbage_cards_are_detected_for_self_healing():
         {'title': 'MySQL CREATE TABLE Statement', 'summary': 'Explains the CREATE TABLE syntax.'}
     )
     assert not _is_garbage_card({'title': 'Passeio a serra', 'summary': 'Subi a Serra da Estrela com a Maria.'})
+
+
+def test_stats_merge_people_titles_and_case_insensitive_tags():
+    from open_webui.utils.brain import add_card_to_stats, empty_stats, finalise_stats
+
+    stats = empty_stats()
+    add_card_to_stats(stats, {
+        'brain': {
+            'category': 'memory',
+            'tags': ['MySQL', 'sql'],
+            'entities': [{'type': 'person', 'name': 'Profª Rosa Carranca'}],
+        }
+    })
+    add_card_to_stats(stats, {
+        'brain': {
+            'category': 'document',
+            'tags': ['mysql'],
+            'entities': [{'type': 'person', 'name': 'Rosa Carranca'}],
+        }
+    })
+    out = finalise_stats(stats)
+
+    # "Profª Rosa Carranca" e "Rosa Carranca" são a mesma pessoa
+    assert out['people'] == 1
+    pessoas = [e for e in out['top_entities'] if e['type'] == 'person']
+    assert len(pessoas) == 1 and pessoas[0]['count'] == 2
+    assert not pessoas[0]['name'].lower().startswith('prof')
+    assert pessoas[0]['name'].lower() == 'rosa carranca'
+
+    # "MySQL" e "mysql" somam na mesma etiqueta
+    tags = {t['name']: t['count'] for t in out['top_tags']}
+    assert tags.get('mysql') == 2
+    assert 'MySQL' not in tags
