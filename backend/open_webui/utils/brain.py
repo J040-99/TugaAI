@@ -543,20 +543,35 @@ def parse_reflection_payload(raw) -> dict | None:
     if fenced:
         text = fenced.group(1).strip()
 
+    data = None
     start, end = text.find('{'), text.rfind('}')
-    if start == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, dict):
+                data = parsed
+        except json.JSONDecodeError:
+            data = None
+
+    if data is None:
+        # Sem JSON: modelos pequenos/devolvem prosa — usa o texto como índice
+        # de memória em vez de deitar fora a resposta.
+        prose = _clean_str(text, 4000)
+        if len(prose) >= 40:
+            log.info('brain: reflection was not JSON — using plain text as memory index')
+            return {'memory_index': prose, 'insights': []}
         return None
 
     memory_index = _clean_str(data.get('memory_index'), 4000)
     insights = _normalise_insights(data.get('insights'))
 
     if not memory_index and not insights:
+        # Modelos pequenos/devolvem prosa em vez de JSON: usa o texto como
+        # índice de memória em vez de deitar fora a resposta.
+        prose = _clean_str(text, 4000)
+        if len(prose) >= 40:
+            log.info('brain: reflection was not JSON — using plain text as memory index')
+            return {'memory_index': prose, 'insights': []}
         return None
     return {'memory_index': memory_index, 'insights': insights}
 

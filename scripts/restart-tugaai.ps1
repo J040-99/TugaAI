@@ -179,9 +179,15 @@ if ($blocked.Count -gt 0) {
 # ----------------------------------------------------------------- arrancar
 if (-not $SkipBackend) {
     Write-Step "A arrancar o backend (porta $BackendPort)..."
+    # Log para ficheiro: os avisos do cérebro (brain: ...) ficam consultáveis.
+    $stampBackend = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backendOut = Join-Path $LogDir "backend-$stampBackend.out.log"
+    $backendErr = Join-Path $LogDir "backend-$stampBackend.err.log"
     Start-Process -FilePath $env:ComSpec `
         -ArgumentList '/c', "`"$(Join-Path $BackendDir 'start_windows.bat')`"" `
-        -WorkingDirectory $BackendDir -WindowStyle Minimized
+        -WorkingDirectory $BackendDir -WindowStyle Minimized `
+        -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr
+    Write-Ok "log: $backendOut"
 }
 
 if (-not $SkipFrontend) {

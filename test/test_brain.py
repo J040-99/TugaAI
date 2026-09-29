@@ -309,3 +309,20 @@ def test_client_settings_nested_under_ui():
     )
     # Sem catálogo de modelos no servidor → primeiro modelo da ligação do cliente
     assert resolve_model(user, 'organize', {}) == 'google/gemma-4-26b-a4b-it:free'
+
+
+def test_reflection_accepts_plain_prose_when_model_skips_json():
+    """Modelos pequenos/devolvem texto livre — nao pode ser deitado fora."""
+    from open_webui.utils.brain import parse_reflection_payload
+
+    prose = (
+        'A base de conhecimento fala de viagens em familia e de trabalho no '
+        'projeto TugaAI, com pessoas como Maria e Joao ao longo de setembro.'
+    )
+    payload = parse_reflection_payload(prose)
+    assert payload is not None
+    assert payload['memory_index'] == prose
+    assert payload['insights'] == []
+
+    # Texto demasiado curto continua a ser rejeitado
+    assert parse_reflection_payload('curto demais') is None
