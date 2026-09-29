@@ -355,3 +355,22 @@ def test_build_ask_prompt_packs_memory_stats_cards_and_question():
     # Sem fichas casadas → bloco explicito (nao vazio)
     vazia = build_ask_prompt('x', state, [], None)
     assert 'nenhuma ficha corresponde' in vazia
+
+
+def test_reasoning_leak_is_rejected_and_prose_still_accepted():
+    from open_webui.utils.brain import _looks_like_reasoning, parse_brain_payload, parse_reflection_payload
+
+    leaked = ("Here's a thinking process:1. **Analyze User Request:** - "
+              "**Goal:** Create a JSON object with two keys: memory_index and insights...")
+    assert _looks_like_reasoning(leaked)
+    assert not _looks_like_reasoning('A base de conhecimento fala de viagens e de trabalho.')
+
+    # Nunca suja a memoria nem gera fichas a partir de pensamento vazado
+    assert parse_reflection_payload(leaked) is None
+    assert parse_brain_payload(leaked) is None
+
+    # Prosa normal continua aceite (fallback)
+    prosa = ('Este documento resume a materia de base de dados do2 ano com exemplos praticos '
+             'de SQL, criacao de tabelas e consultas.')
+    ok = parse_reflection_payload(prosa)
+    assert ok is not None and 'base de dados' in ok['memory_index']

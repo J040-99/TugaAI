@@ -72,6 +72,18 @@ def _clean_str(value, limit: int) -> str:
     return ' '.join(value.split())[:limit]
 
 
+def _looks_like_reasoning(text: str) -> bool:
+    """Resposta que é só "pensamento" do modelo a vazar — não serve de conteúdo."""
+    head = (text or '')[:400].lower()
+    return bool(
+        re.search(
+            r'thinking process|let me (think|analyz|analys)|analy[sz]e user request|'
+            r'<think|step[- ]by[- ]step|objective:.*goal:',
+            head,
+        )
+    )
+
+
 def _normalise_tags(raw_tags) -> list[str]:
     """Lista de tags: strings, minúsculas, sem duplicados, máx. 8."""
     tags: list[str] = []
@@ -141,6 +153,9 @@ def parse_brain_payload(raw) -> dict | None:
 
     data = _load_json_object(text)
     if data is None:
+        if _looks_like_reasoning(text):
+            log.warning('brain: organiser leaked reasoning — skipping (retry next cycle)')
+            return None
         prose = _clean_str(text, 600)
         if len(prose) >= 40:
             log.info('brain: organiser returned non-JSON — building a minimal card')
@@ -333,7 +348,7 @@ async def organize_file(request, file_id: str, user) -> dict | None:
         'temperature': 0,
         # Modelos de raciocínio (ex.: nemotron) "pensam" antes de responder —
         # com pouco espaço o JSON sai truncado e não parseia.
-        'max_tokens': 3000,
+        'max_tokens': 4000,
     }
 
     try:
@@ -410,6 +425,10 @@ Reflecte sobre ele e responde APENAS com um único objecto JSON (sem markdown, s
 REGRA OBRIGATÓRIO DE LÍNGUA: escreve memory_index, topic e summary SEMPRE em
 português de Portugal — nunca em inglês, mesmo que o inventário esteja em inglês.
 
+REGRA DE FORMATO: vai DIRECTO ao JSON final. NÃO escrevas o teu processo de
+pensamento, nem frases como "Here's a thinking process", nem passos, nem
+comentários — só o objecto JSON.
+
 Sê concreto e útil; nunca inventes documentos que não estejam listados.
 
 Inventário:
@@ -445,7 +464,18 @@ def load_reflection() -> dict:
 
 
 def save_reflection(state: dict) -> None:
-    """Grava a reflexão de forma atómica; nunca levanta exceção."""
+    """Grava a reflexão de forma atómica; nunca levanta exceção.
+
+    Se um ciclo não produziu índice/insights (resposta não-JSON, provedor em
+    baixo), mantém os anteriores — azar de um ciclo nunca apaga bom conteúdo.
+    """
+    if not state.get('memory_index') and not state.get('insights'):
+        previous = load_reflection()
+        if previous.get('memory_index'):
+            state['memory_index'] = previous['memory_index']
+            state['insights'] = previous.get('insights') or []
+            state['model'] = previous.get('model')
+
     try:
         path = str(_reflection_path())
         tmp_path = f'{path}.tmp'
@@ -578,8 +608,11 @@ def parse_reflection_payload(raw) -> dict | None:
 
     data = _load_json_object(text)
     if data is None:
-        # Sem JSON: modelos pequenos/devolvem prosa — usa o texto como índice
-        # de memória em vez de deitar fora a resposta.
+        # Sem JSON: prosa util serve de índice — mas se for só o "pensamento"
+        # do modelo a vazar, não suja a memória (mantém-se a anterior).
+        if _looks_like_reasoning(text):
+            log.warning('brain: reflection leaked reasoning — keeping previous index')
+            return None
         prose = _clean_str(text, 4000)
         if len(prose) >= 40:
             log.info('brain: reflection was not JSON — using plain text as memory index')
@@ -762,7 +795,7 @@ async def run_reflection(app) -> dict:
             'messages': [{'role': 'user', 'content': build_reflection_prompt(cards)}],
             'stream': False,
             'temperature': 0.2,
-            'max_tokens': 2500,  # espaço para o raciocínio + JSON completo
+            'max_tokens': 4500,  # pensamento + JSON completo (modelos de raciocínio)
         }
         try:
             raw = await complete_with_provider(_reflection_request(app), form_data, user, model)
