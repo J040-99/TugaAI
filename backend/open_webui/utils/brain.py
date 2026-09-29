@@ -961,7 +961,9 @@ async def _post_chat(base_url: str, api_key: str, payload: dict) -> str | None:
     delay = 1.0
     for attempt in range(3):
         try:
-            timeout = aiohttp.ClientTimeout(total=180)
+            # Modelos de raciocínio com documentos longos passam dos3 min —
+            # margem generosa para não matar a organização a meio.
+            timeout = aiohttp.ClientTimeout(total=420)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 429 and attempt < 2:
