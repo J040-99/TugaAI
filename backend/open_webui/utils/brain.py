@@ -396,21 +396,23 @@ BACKLOG_ORGANIZE_PER_CYCLE = int(os.getenv('BRAIN_BACKLOG_PER_CYCLE', '5'))
 BRAIN_REFLECTION_FILENAME = 'brain_reflection.json'
 BRAIN_REFLECTION_MAX_INSIGHTS = 6
 
-REFLECTION_PROMPT_TEMPLATE = """You are the long-term memory of a personal knowledge base (a "brain").
-Below is the current inventory of organised documents (date | category | title — summary; entities).
+REFLECTION_PROMPT_TEMPLATE = """És a memória de longo prazo de uma base de conhecimento pessoal (o "cérebro").
+Abaixo está o inventário actual dos documentos organizados (data | categoria | título — resumo; entidades).
 
-Reflect on it and answer with ONLY a single JSON object (no markdown, no commentary):
+Reflecte sobre ele e responde APENAS com um único objecto JSON (sem markdown, sem comentários):
 
-  "memory_index": 1-3 paragraph description of everything this person's knowledge base is about —
-                  who/what appears often, main themes, timeline. Written in the SAME language as
-                  the documents (Portuguese if they are in Portuguese).
-  "insights":     array of 1 to {max_insights} objects connecting documents that belong together:
-                    {"topic": "short theme", "summary": "1-2 sentences on the connection",
-                     "related": ["exact document titles that connect"]}
+  "memory_index": descrição em1-3 parágrafos de TUDO o que esta base de conhecimento cobre —
+                  quem/falas aparecem com frequência, temas principais, cronologia.
+  "insights":     array de1 a {max_insights} objetos que ligam documentos que pertencem juntos:
+                    {"topic": "tema curto", "summary": "1-2 frases sobre a ligação",
+                     "related": ["títulos exactos dos documentos que se ligam"]}
 
-Be concrete and useful; never invent documents that are not listed.
+REGRA OBRIGATÓRIO DE LÍNGUA: escreve memory_index, topic e summary SEMPRE em
+português de Portugal — nunca em inglês, mesmo que o inventário esteja em inglês.
 
-Inventory:
+Sê concreto e útil; nunca inventes documentos que não estejam listados.
+
+Inventário:
 ---
 {inventory}
 ---
@@ -781,6 +783,116 @@ async def run_reflection(app) -> dict:
         len(state['insights']),
     )
     return state
+
+
+##########################################
+# Chat com o cérebro — "pergunta à tua memória"
+#
+# Monta um prompt com o índice de memória + estatísticas + fichas que
+# casam com a pergunta e responde via o provedor DO CLIENTE.
+##########################################
+
+ASK_PROMPT_TEMPLATE = """És o "cérebro" pessoal do utilizador — memória de longo prazo de uma base de
+conhecimento pessoal. Responde em português de Portugal, raciocinando à frente
+com base APENAS no material abaixo (não inventes).
+
+Regras:
+- Se a resposta não estiver na memória, diz claramente que não te lembras disso.
+- Cita os documentos relevantes pelo nome entre [ ].
+- Sê directo e útil; podes ligar factos de documentos diferentes.
+
+### Índice de memória (visão geral)
+{memory_index}
+
+### Estatísticas da base
+{stats}
+
+### Fichas relevantes
+{cards}
+
+### Pergunta do utilizador
+{question}
+"""
+
+
+def build_ask_prompt(question: str, state: dict, cards: list[dict], user=None) -> str:
+    """Prompt da conversa com o cérebro (função pura, testável)."""
+    stats = (state or {}).get('stats') or {}
+    stats_line = (
+        f"documentos={stats.get('documents', 0)}, pessoas={stats.get('people', 0)}, "
+        f"lugares={stats.get('places', 0)}, categorias={stats.get('categories', {})}"
+    )
+    memory_index = (state or {}).get('memory_index') or '(ainda sem índice de memória)'
+
+    lines = []
+    for card in cards[:15]:
+        brain = card.get('brain') or {}
+        filename = card.get('filename') or '?'
+        title = brain.get('title') or filename
+        summary = (brain.get('summary') or '')[:400]
+        date = brain.get('date') or '?'
+        line = f'- [{filename}] {date} | {title}'
+        if summary:
+            line += f' — {summary}'
+        lines.append(line)
+    cards_block = '\n'.join(lines) if lines else '(nenhuma ficha corresponde à pergunta)'
+
+    owner = getattr(user, 'name', None) or 'o utilizador'
+    return (
+        ASK_PROMPT_TEMPLATE.replace('{memory_index}', memory_index)
+        .replace('{stats}', stats_line)
+        .replace('{cards}', cards_block)
+        .replace('{question}', question.strip())
+        .replace('{owner}', owner)
+    )
+
+
+async def answer_question(request, question: str, user) -> dict | None:
+    """Resposta do cérebro a uma pergunta: contexto + provedor do cliente."""
+    question = (question or '').strip()
+    if not question or not BRAIN_ORGANIZE_ENABLED:
+        return None
+
+    state = load_reflection()
+
+    # Fichas que casam com a pergunta (varrimento leve, com limite).
+    matched: list[dict] = []
+    async for card in iter_brain_cards():
+        if card_matches(card, q=question):
+            matched.append(card)
+            if len(matched) >= 15:
+                break
+
+    models = getattr(request.app.state, 'MODELS', None) or {}
+    model = resolve_model(user, 'organize', models)
+    if not model:
+        log.debug('brain: no model available to answer questions')
+        return None
+
+    prompt = build_ask_prompt(question, state, matched, user)
+    form_data = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'stream': False,
+        'temperature': 0.3,
+        'max_tokens': 1500,
+    }
+
+    try:
+        answer = await complete_with_provider(request, form_data, user, model)
+    except Exception:
+        log.warning('brain: question answering failed', exc_info=True)
+        return None
+
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+
+    log.info('brain: question answered by %s (%d chars)', model, len(answer))
+    return {
+        'answer': answer.strip(),
+        'sources': [card.get('filename') for card in matched if card.get('filename')],
+        'model': model,
+    }
 
 
 async def brain_reflection_loop(app) -> None:

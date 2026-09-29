@@ -326,3 +326,32 @@ def test_reflection_accepts_plain_prose_when_model_skips_json():
 
     # Texto demasiado curto continua a ser rejeitado
     assert parse_reflection_payload('curto demais') is None
+
+
+def test_build_ask_prompt_packs_memory_stats_cards_and_question():
+    from open_webui.utils.brain import build_ask_prompt
+
+    state = {
+        'memory_index': 'A base fala de viagens em familia e de trabalho.',
+        'stats': {'documents': 6, 'people':2, 'places':1, 'categories': {'memory':3}},
+    }
+    cards = [
+        {
+            'filename': 'viagem.pdf',
+            'brain': {'title': 'Viagem a Lisboa', 'summary': 'Fui a Lisboa com a Maria.', 'date': '2026-09-01'},
+        }
+    ]
+
+    class _User:
+        name = 'Mica'
+
+    prompt = build_ask_prompt('Onde é que eu estive?', state, cards, _User())
+
+    assert 'português de Portugal' in prompt  # lingua obrigatoria
+    assert 'A base fala de viagens em familia e de trabalho.' in prompt
+    assert 'documentos=6' in prompt
+    assert '- [viagem.pdf] 2026-09-01 | Viagem a Lisboa — Fui a Lisboa com a Maria.' in prompt
+    assert 'Onde é que eu estive?' in prompt
+    # Sem fichas casadas → bloco explicito (nao vazio)
+    vazia = build_ask_prompt('x', state, [], None)
+    assert 'nenhuma ficha corresponde' in vazia

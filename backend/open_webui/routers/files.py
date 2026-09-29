@@ -658,6 +658,23 @@ async def list_brain_cards(
 ############################
 
 
+class BrainAskForm(BaseModel):
+    question: str
+
+
+@router.post('/brain/ask', response_model=dict)
+async def ask_brain(request: Request, form_data: BrainAskForm, user=Depends(get_verified_user)):
+    """Chat com o cérebro: responde a partir do índice de memória + fichas."""
+    from open_webui.utils.brain import answer_question
+
+    result = await answer_question(request, form_data.question, user)
+    if not result:
+        raise HTTPException(
+            status_code=503, detail='O cérebro não está disponível de momento. Tenta outra vez.'
+        )
+    return result
+
+
 @router.get('/search', response_model=list[FileModelResponse])
 async def search_files(
     filename: str = Query(
