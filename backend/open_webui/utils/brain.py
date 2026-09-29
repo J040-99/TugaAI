@@ -102,11 +102,34 @@ def _normalise_entities(raw_entities) -> list[dict]:
     return entities
 
 
+def _load_json_object(text: str) -> dict | None:
+    """Extrai o primeiro objeto JSON válido de uma resposta de LLM.
+
+    Usa ``JSONDecoder.raw_decode`` — ignora prosa antes/depois (típico de
+    modelos de raciocínio) e, em fallback, tenta sem vírgulas finais.
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    tail = text[start:]
+    decoder = json.JSONDecoder()
+    for candidate in (tail, re.sub(r',(\s*[}\]])', r'\1', tail)):
+        try:
+            data, _ = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 def parse_brain_payload(raw) -> dict | None:
     """Extrai e valida o JSON do cérebro a partir da resposta do LLM.
 
     Tolerante ao mundo real: cercas ```json, texto antes/depois, chaves em
-    falta, tipos errados. Devolve None quando não há nada utilizável.
+    falta, tipos errados. Sem JSON aproveitável mas com texto suficiente,
+    monta uma ficha mínima — melhor uma ficha simples do que nada.
     """
     if not isinstance(raw, str) or not raw.strip():
         return None
@@ -116,16 +139,20 @@ def parse_brain_payload(raw) -> dict | None:
     if fenced:
         text = fenced.group(1).strip()
 
-    start, end = text.find('{'), text.rfind('}')
-    if start == -1 or end <= start:
-        return None
-
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(data, dict):
+    data = _load_json_object(text)
+    if data is None:
+        prose = _clean_str(text, 600)
+        if len(prose) >= 40:
+            log.info('brain: organiser returned non-JSON — building a minimal card')
+            first_sentence = prose.split('. ')[0]
+            return {
+                'title': _clean_str(first_sentence, 100) or 'Documento',
+                'summary': prose,
+                'tags': [],
+                'category': 'document',
+                'date': None,
+                'entities': [],
+            }
         return None
 
     title = _clean_str(data.get('title'), 120)
@@ -304,7 +331,9 @@ async def organize_file(request, file_id: str, user) -> dict | None:
         'messages': [{'role': 'user', 'content': build_prompt(content)}],
         'stream': False,
         'temperature': 0,
-        'max_tokens': 700,
+        # Modelos de raciocínio (ex.: nemotron) "pensam" antes de responder —
+        # com pouco espaço o JSON sai truncado e não parseia.
+        'max_tokens': 3000,
     }
 
     try:
@@ -362,6 +391,8 @@ def schedule_organize(request, file_id: str, user) -> None:
 BRAIN_REFLECT_INTERVAL = float(os.getenv('BRAIN_REFLECT_INTERVAL', '60'))
 BRAIN_REFLECT_MIN_CARDS = 2
 BRAIN_REFLECT_MAX_CARDS = 150
+# Ficheiros antigos (feitos antes do cérebro) organizados por ciclo:
+BACKLOG_ORGANIZE_PER_CYCLE = int(os.getenv('BRAIN_BACKLOG_PER_CYCLE', '5'))
 BRAIN_REFLECTION_FILENAME = 'brain_reflection.json'
 BRAIN_REFLECTION_MAX_INSIGHTS = 6
 
@@ -543,16 +574,7 @@ def parse_reflection_payload(raw) -> dict | None:
     if fenced:
         text = fenced.group(1).strip()
 
-    data = None
-    start, end = text.find('{'), text.rfind('}')
-    if start != -1 and end > start:
-        try:
-            parsed = json.loads(text[start : end + 1])
-            if isinstance(parsed, dict):
-                data = parsed
-        except json.JSONDecodeError:
-            data = None
-
+    data = _load_json_object(text)
     if data is None:
         # Sem JSON: modelos pequenos/devolvem prosa — usa o texto como índice
         # de memória em vez de deitar fora a resposta.
@@ -644,8 +666,68 @@ async def _recent_cards(limit: int) -> list[dict]:
     return [card for _, _, card in sorted(heap, key=lambda item: item[0], reverse=True)]
 
 
+async def _organize_if_pending(file, request) -> bool:
+    """Organiza um ficheiro que ainda não tem ficha. True se criou ficha."""
+    from open_webui.models.users import Users
+
+    data = file.data if isinstance(file.data, dict) else {}
+    if data.get('brain'):
+        return False
+    content = data.get('content')
+    if not isinstance(content, str) or len(content.strip()) < 40:
+        return False
+
+    owner = None
+    try:
+        owner = await Users.get_user_by_id(file.user_id)
+    except Exception:
+        owner = None
+    user = owner or await _brain_system_user()
+    if not user:
+        return False
+
+    result = await organize_file(request, file.id, user)
+    return bool(result)
+
+
+async def organize_backlog(request, limit: int = BACKLOG_ORGANIZE_PER_CYCLE) -> int:
+    """Organiza ficheiros antigos ainda sem ficha do cérebro (auto-sanagem).
+
+    Uploads feitos ANTES de o cérebro existir não passaram pela organização —
+    sem ficha não entram nas estatísticas nem na reflexão. Corre no início de
+    cada ciclo, com limite para nunca tornar o ciclo interminável.
+    """
+    from open_webui.models.files import Files
+
+    organized = 0
+    skip = 0
+    while organized < limit:
+        page = await Files.get_file_list(skip=skip, limit=50)
+        if not page.items:
+            break
+        for file in page.items:
+            if organized >= limit:
+                break
+            if await _organize_if_pending(file, request):
+                organized += 1
+                log.info('brain: backlog organised %d/%d — %s', organized, limit, file.filename)
+        skip += len(page.items)
+        if page.total is not None and skip >= page.total:
+            break
+
+    if organized:
+        log.info('brain: backlog organised %d file(s) this cycle', organized)
+    return organized
+
+
 async def run_reflection(app) -> dict:
     """Um ciclo de raciocínio: stats → (opcional) insights via LLM → estado."""
+
+    # Passo 0: backlog — uploads antigos sem ficha (dá material à reflexão).
+    try:
+        await organize_backlog(_reflection_request(app))
+    except Exception:
+        log.exception('brain: backlog organisation failed')
 
     # Passo 1: stats em streaming — só contadores na memória, nunca as fichas
     # e muito menos o conteúdo dos ficheiros.
@@ -678,7 +760,7 @@ async def run_reflection(app) -> dict:
             'messages': [{'role': 'user', 'content': build_reflection_prompt(cards)}],
             'stream': False,
             'temperature': 0.2,
-            'max_tokens': 1100,
+            'max_tokens': 2500,  # espaço para o raciocínio + JSON completo
         }
         try:
             raw = await complete_with_provider(_reflection_request(app), form_data, user, model)
