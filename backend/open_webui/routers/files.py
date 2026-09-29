@@ -675,6 +675,56 @@ async def ask_brain(request: Request, form_data: BrainAskForm, user=Depends(get_
     return result
 
 
+class BrainCardForm(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    category: str | None = None
+    date: str | None = None
+
+
+def _require_brain_access(file, user) -> None:
+    """Só o dono (ou admin) mexe nas fichas/ficheiros do cérebro."""
+    if file.user_id != user.id and user.role != 'admin':
+        raise HTTPException(status_code=403, detail='Sem permissão para este ficheiro.')
+
+
+@router.put('/brain/{id}/card', response_model=dict)
+async def update_brain_card(id: str, form_data: BrainCardForm, user=Depends(get_verified_user)):
+    """Gestor: editar a ficha do cérebro (título, resumo, tags, categoria, data)."""
+    import time as _time
+
+    file = await Files.get_file_by_id(id)
+    if not file:
+        raise HTTPException(status_code=404, detail='Ficheiro não encontrado.')
+    _require_brain_access(file, user)
+
+    brain = dict(file.data.get('brain')) if isinstance(file.data, dict) and file.data.get('brain') else {}
+    brain.update(form_data.model_dump(exclude_unset=True))
+    brain['edited_at'] = int(_time.time())
+    updated = await Files.update_file_data_by_id(id, {'brain': brain})
+    return (updated.data or {}).get('brain') or brain
+
+
+@router.post('/brain/{id}/reorganize', response_model=dict)
+async def reorganize_brain_file(id: str, request: Request, user=Depends(get_verified_user)):
+    """Gestor: reprocessa a ficha do cérebro de um ficheiro (reorganizar)."""
+    from open_webui.utils.brain import organize_file
+
+    file = await Files.get_file_by_id(id)
+    if not file:
+        raise HTTPException(status_code=404, detail='Ficheiro não encontrado.')
+    _require_brain_access(file, user)
+
+    result = await organize_file(request, id, user)
+    if not result:
+        raise HTTPException(
+            status_code=503,
+            detail='Não foi possível reorganizar agora (modelo ocupado). Tenta mais tarde.',
+        )
+    return result
+
+
 @router.get('/search', response_model=list[FileModelResponse])
 async def search_files(
     filename: str = Query(

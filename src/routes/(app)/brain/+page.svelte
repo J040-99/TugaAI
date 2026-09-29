@@ -97,9 +97,43 @@
 	const loadMore = () => loadPage(page + 1, true);
 
 	// Chat com o cérebro: pergunta → /brain/ask → resposta com fontes.
+	const CHAT_KEY = 'tugaai.brain.chat.v1';
 	let question = '';
 	let asking = false;
 	let chat: { q: string; a: string; sources: string[] }[] = [];
+
+	// Gestor de informação (ficheiros do cérebro)
+	let uploading = false;
+	let fileInput: HTMLInputElement;
+	let editingId = '';
+	let editTitle = '';
+	let editSummary = '';
+
+	const persistChat = () => {
+		try {
+			localStorage.setItem(CHAT_KEY, JSON.stringify(chat.slice(0, 50)));
+		} catch {
+			/* armazenamento indisponível */
+		}
+	};
+
+	const restoreChat = () => {
+		try {
+			const saved = JSON.parse(localStorage.getItem(CHAT_KEY) ?? '[]');
+			if (Array.isArray(saved)) chat = saved;
+		} catch {
+			chat = [];
+		}
+	};
+
+	const clearChat = () => {
+		chat = [];
+		try {
+			localStorage.removeItem(CHAT_KEY);
+		} catch {
+			/* noop */
+		}
+	};
 
 	const askBrain = async () => {
 		const q = question.trim();
@@ -115,11 +149,92 @@
 			if (!res.ok) throw new Error('ask failed');
 			const data = await res.json();
 			chat = [{ q, a: data.answer ?? '', sources: data.sources ?? [] }, ...chat];
+			persistChat();
 			question = '';
 		} catch {
 			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
 		} finally {
 			asking = false;
+		}
+	};
+
+	const onUploadFiles = async (event: Event) => {
+		const input = event.target as HTMLInputElement;
+		if (!input.files || input.files.length === 0) return;
+		uploading = true;
+		try {
+			for (const file of Array.from(input.files)) {
+				const form = new FormData();
+				form.append('file', file);
+				const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/?process=true`, {
+					method: 'POST',
+					headers: authHeaders(),
+					credentials: 'include',
+					body: form
+				});
+				if (!res.ok) throw new Error('upload failed');
+			}
+			toast.success($i18n.t('Uploaded'));
+			await loadPage(1, false);
+		} catch {
+			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
+		} finally {
+			uploading = false;
+			input.value = '';
+		}
+	};
+
+	const deleteFile = async (id: string, name: string) => {
+		if (!confirm(`${$i18n.t('Delete')}: ${name}`)) return;
+		try {
+			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/${id}`, {
+				method: 'DELETE',
+				headers: authHeaders(),
+				credentials: 'include'
+			});
+			if (!res.ok) throw new Error('delete failed');
+			toast.success($i18n.t('Deleted'));
+			await loadPage(1, false);
+		} catch {
+			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
+		}
+	};
+
+	const reorganiseFile = async (id: string) => {
+		try {
+			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/${id}/reorganize`, {
+				method: 'POST',
+				headers: authHeaders(),
+				credentials: 'include'
+			});
+			if (!res.ok) throw new Error('reorganize failed');
+			toast.success($i18n.t('Saved'));
+			await loadPage(1, false);
+		} catch {
+			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
+		}
+	};
+
+	const startEditCard = (card: any) => {
+		editingId = card.id;
+		editTitle = card.brain?.title ?? '';
+		editSummary = card.brain?.summary ?? '';
+	};
+
+	const saveCard = async (id: string) => {
+		try {
+			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/${id}/card`, {
+				method: 'PUT',
+				headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+				credentials: 'include',
+				body: JSON.stringify({ title: editTitle, summary: editSummary })
+			});
+			if (!res.ok) throw new Error('save failed');
+			toast.success($i18n.t('Saved'));
+			editingId = '';
+			await loadPage(1, false);
+		} catch {
+			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
 		}
 	};
 
@@ -156,6 +271,7 @@
 	};
 
 	onMount(() => {
+		restoreChat();
 		loadPage(1, false);
 		loadBrainSettings();
 	});
@@ -375,9 +491,19 @@
 			<section
 				class="mb-6 rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"
 			>
-				<h2 class="text-sm font-semibold text-gray-900 dark:text-white">
-					{$i18n.t('Talk to the brain')}
-				</h2>
+				<div class="flex items-center justify-between gap-2">
+					<h2 class="text-sm font-semibold text-gray-900 dark:text-white">
+						{$i18n.t('Talk to the brain')}
+					</h2>
+					{#if chat.length > 0}
+						<button
+							class="rounded-lg px-2 py-1 text-xs text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+							on:click={clearChat}
+						>
+							{$i18n.t('Clear conversation')}
+						</button>
+					{/if}
+				</div>
 
 				<form class="mt-2 flex gap-2" on:submit|preventDefault={askBrain}>
 					<input
@@ -394,6 +520,16 @@
 						{asking ? '…' : $i18n.t('Send')}
 					</button>
 				</form>
+
+				<!-- Barra de carregamento enquanto o cérebro raciocina -->
+				{#if asking}
+					<div
+						class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"
+						role="progressbar"
+					>
+						<div class="h-full w-2/5 animate-pulse rounded-full bg-gray-900 dark:bg-white"></div>
+					</div>
+				{/if}
 
 				{#if chat.length > 0}
 					<div class="mt-3 space-y-3">
@@ -414,6 +550,97 @@
 						{/each}
 					</div>
 				{/if}
+			</section>
+
+			<!-- Gestor de informação: adicionar, editar, reorganizar, apagar -->
+			<section
+				class="mb-6 rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"
+			>
+				<div class="flex items-center justify-between gap-3">
+					<h2 class="text-sm font-semibold text-gray-900 dark:text-white">
+						{$i18n.t('Information manager')}
+					</h2>
+					<button
+						class="rounded-xl bg-gray-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-gray-800 disabled:opacity-60 dark:bg-white dark:text-gray-900"
+						disabled={uploading}
+						on:click={() => fileInput?.click()}
+					>
+						{uploading ? '…' : `+ ${$i18n.t('Add Files')}`}
+					</button>
+					<input
+						bind:this={fileInput}
+						type="file"
+						multiple
+						class="hidden"
+						on:change={onUploadFiles}
+					/>
+				</div>
+
+				<div class="mt-3 space-y-2">
+					{#each cards as card (card.id)}
+						<div class="rounded-xl border border-gray-100 p-2.5 dark:border-gray-800">
+							<div class="flex flex-wrap items-center gap-2">
+								<span class="min-w-0 flex-1 truncate text-sm text-gray-800 dark:text-gray-100">
+									{card.filename}
+								</span>
+								<button
+									class="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+									on:click={() => reorganiseFile(card.id)}
+								>
+									{$i18n.t('Reorganise')}
+								</button>
+								<button
+									class="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+									on:click={() => startEditCard(card)}
+								>
+									{$i18n.t('Edit')}
+								</button>
+								<button
+									class="rounded-lg bg-red-50 px-2 py-1 text-xs text-red-600 transition hover:bg-red-100 dark:bg-red-500/10 dark:text-red-400"
+									on:click={() => deleteFile(card.id, card.filename)}
+								>
+									{$i18n.t('Delete')}
+								</button>
+							</div>
+
+							{#if editingId === card.id}
+								<div class="mt-2 space-y-2">
+									<input
+										bind:value={editTitle}
+										class="focus-ring w-full rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-950"
+										placeholder={$i18n.t('Title')}
+									/>
+									<textarea
+										bind:value={editSummary}
+										rows="2"
+										class="focus-ring w-full rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm dark:border-gray-700 dark:bg-gray-950"
+										placeholder={$i18n.t('Summary')}
+									></textarea>
+									<div class="flex gap-2">
+										<button
+											class="rounded-lg bg-gray-900 px-2.5 py-1 text-xs font-medium text-white disabled:opacity-60 dark:bg-white dark:text-gray-900"
+											on:click={() => saveCard(card.id)}
+										>
+											{$i18n.t('Save')}
+										</button>
+										<button
+											class="rounded-lg bg-gray-100 px-2.5 py-1 text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+											on:click={() => (editingId = '')}
+										>
+											{$i18n.t('Cancel')}
+										</button>
+									</div>
+								</div>
+							{/if}
+						</div>
+					{/each}
+
+					{#if cards.length === 0}
+						<p class="text-xs text-gray-400 dark:text-gray-500">
+							{$i18n.t('No memories yet')}
+						</p>
+					{/if}
+				</div>
 			</section>
 
 			<!-- Modelos por função — escolha deste cliente -->
