@@ -3570,6 +3570,8 @@
 	"Clear conversation": "Limpar conversa",
 	"Summary": "Resumo",
 	"Thinking…": "A pensar…",
+	"Duplicate": "Duplicado",
+	"Clean duplicates": "Limpar cópias idênticas (mantendo uma por ficheiro)?",
 	"Retrying…": "A retentar…",
 	"Spending": "Gastos",
 	"Spending limits": "Limites de gastos",

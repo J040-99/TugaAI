@@ -243,6 +243,33 @@
 		}
 	};
 
+	// Duplicados: cópias byte-a-byte idênticas (mesmo hash) entre os cartões carregados
+	$: dupCounts = (() => {
+		const map = new Map<string, number>();
+		for (const card of cards) {
+			const key = card.hash ?? card.id;
+			map.set(key, (map.get(key) ?? 0) + 1);
+		}
+		return map;
+	})();
+
+	const cleanupDuplicates = async () => {
+		if (!confirm($i18n.t('Clean duplicates'))) return;
+		try {
+			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/cleanup-duplicates`, {
+				method: 'POST',
+				headers: authHeaders(),
+				credentials: 'include'
+			});
+			if (!res.ok) throw new Error('cleanup failed');
+			const data = await res.json();
+			toast.success(`${$i18n.t('Deleted')}: ${data.deleted}`);
+			await loadPage(1, false);
+		} catch {
+			toast.error($i18n.t('Uh-oh! There was an issue with the response.'));
+		}
+	};
+
 	// Preferências deste cliente: que modelo o cérebro usa em cada função.
 	const loadBrainSettings = async () => {
 		try {
@@ -577,13 +604,21 @@
 					<h2 class="text-sm font-semibold text-gray-900 dark:text-white">
 						{$i18n.t('Information manager')}
 					</h2>
-					<button
-						class="rounded-xl bg-gray-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-gray-800 disabled:opacity-60 dark:bg-white dark:text-gray-900"
-						disabled={uploading}
-						on:click={() => fileInput?.click()}
-					>
-						{uploading ? '…' : `+ ${$i18n.t('Add Files')}`}
-					</button>
+					<div class="flex items-center gap-2">
+						<button
+							class="rounded-xl border border-amber-200 px-3 py-1.5 text-xs font-medium text-amber-700 transition hover:bg-amber-50 disabled:opacity-60 dark:border-amber-500/30 dark:text-amber-300"
+							on:click={cleanupDuplicates}
+						>
+							{$i18n.t('Clean duplicates')}
+						</button>
+						<button
+							class="rounded-xl bg-gray-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-gray-800 disabled:opacity-60 dark:bg-white dark:text-gray-900"
+							disabled={uploading}
+							on:click={() => fileInput?.click()}
+						>
+							{uploading ? '…' : `+ ${$i18n.t('Add Files')}`}
+						</button>
+					</div>
 					<input
 						bind:this={fileInput}
 						type="file"
@@ -600,6 +635,13 @@
 								<span class="min-w-0 flex-1 truncate text-sm text-gray-800 dark:text-gray-100">
 									{card.filename}
 								</span>
+								{#if (dupCounts.get(card.hash ?? card.id) ?? 0) > 1}
+									<span
+										class="rounded bg-amber-100 px-1.5 py-0.5 text-[0.625rem] font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+									>
+										{$i18n.t('Duplicate')} ×{dupCounts.get(card.hash ?? card.id)}
+									</span>
+								{/if}
 								<button
 									class="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
 									on:click={() => reorganiseFile(card.id)}

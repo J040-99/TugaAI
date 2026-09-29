@@ -252,6 +252,7 @@ def build_brain_card(file) -> dict | None:
     return {
         'id': file.id,
         'filename': file.filename,
+        'hash': getattr(file, 'hash', None),
         'created_at': file.created_at,
         'updated_at': file.updated_at,
         'brain': {

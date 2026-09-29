@@ -725,6 +725,68 @@ async def reorganize_brain_file(id: str, request: Request, user=Depends(get_veri
     return result
 
 
+@router.post('/brain/cleanup-duplicates', response_model=dict)
+async def cleanup_duplicates(
+    request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    """Gestor: remove cópias byte-a-byte idênticas, mantendo uma por grupo.
+
+    Usa a mesma eliminação do DELETE /files/{id} (limpa knowledge, embeddings,
+    storage e eventos). Sem admin, só opera sobre ficheiros do próprio.
+    """
+    # Passa as páginas (memória limitada) e guarda só metadados ligeiros.
+    groups: dict[str, list] = {}
+    skip = 0
+    while True:
+        page = await Files.get_file_list(skip=skip, limit=100, db=db)
+        if not page.items:
+            break
+        for item in page.items:
+            key = item.hash or item.id
+            groups.setdefault(key, []).append(
+                {'id': item.id, 'user_id': item.user_id, 'filename': item.filename}
+            )
+        skip += len(page.items)
+        if page.total is not None and skip >= page.total:
+            break
+
+    deleted = 0
+    removed_names: list[str] = []
+    for key, copies in groups.items():
+        if len(copies) < 2:
+            continue
+        if user.role != 'admin' and any(c['user_id'] != user.id for c in copies):
+            continue  # nunca mexe em ficheiros de outros utilizadores
+
+        # Manter: preferencialmente um com ligação a knowledge; senão o primeiro.
+        keep = copies[0]
+        for copy in copies:
+            knowledges = await Knowledges.get_knowledges_by_file_id(copy['id'], db=db)
+            if knowledges:
+                keep = copy
+                break
+
+        for copy in copies:
+            if copy['id'] == keep['id']:
+                continue
+            try:
+                result = await delete_file_by_id(request, copy['id'], user, db=db)
+                if isinstance(result, dict) and result.get('message'):
+                    deleted += 1
+                    removed_names.append(copy['filename'])
+            except HTTPException:
+                raise
+            except Exception:
+                log.warning('cleanup-duplicates: failed for %s', copy['id'], exc_info=True)
+
+    log.info('brain: cleanup-duplicates removed %d copies (%d groups)', deleted, len(groups))
+    return {
+        'deleted': deleted,
+        'groups': sum(1 for copies in groups.values() if len(copies) > 1),
+        'files': removed_names[:50],
+    }
+
+
 @router.get('/search', response_model=list[FileModelResponse])
 async def search_files(
     filename: str = Query(
