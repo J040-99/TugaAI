@@ -251,6 +251,25 @@ class FilesTable:
             result = await db.execute(select(File).filter_by(user_id=user_id))
             return [FileModel.model_validate(file) for file in result.scalars().all()]
 
+    async def get_file_by_user_and_hash(
+        self, user_id: str, file_hash: str, db: AsyncSession | None = None
+    ) -> FileModel | None:
+        """Deduplicação: existe já este conteúdo (sha256 dos bytes) deste utilizador?
+
+        Usa ``meta.file_hash`` (gravado no upload) e não a coluna ``hash`` —
+        essa é o sha do TEXTO extraído (calculado depois do processamento).
+        """
+        if not file_hash:
+            return None
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(File)
+                .filter(File.user_id == user_id, File.meta['file_hash'] == file_hash)
+                .limit(1)
+            )
+            file = result.scalars().first()
+            return FileModel.model_validate(file) if file else None
+
     async def get_file_list(
         self,
         user_id: str | None = None,

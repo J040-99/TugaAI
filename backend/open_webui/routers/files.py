@@ -474,32 +474,51 @@ async def upload_file_handler(
             lambda: hashlib.sha256(contents).hexdigest()
         )
 
-        file_item = await Files.insert_new_file(
-            user.id,
-            FileForm(
-                **{
-                    'id': id,
-                    'filename': name,
-                    'path': file_path,
-                    'data': {
-                        **({'status': 'pending'} if process else {}),
-                    },
-                    'meta': {
-                        'name': name,
-                        'content_type': (file.content_type if isinstance(file.content_type, str) else None),
-                        'size': len(contents),
-                        'file_hash': file_hash,
-                        'data': file_metadata,
-                    },
-                }
-            ),
-            db=db,
-        )
+        # Deduplicação no upload: mesmo utilizador + mesmo hash → reutiliza o
+        # ficheiro existente em vez de criar outra cópia (p. ex. uploads repetidos
+        # do mesmo PDF). O blob recém-escrito é removido; o processamento usa o
+        # caminho do ficheiro já existente.
+        existing = await Files.get_file_by_user_and_hash(user.id, file_hash, db=db)
+        if existing:
+            try:
+                await asyncio.to_thread(Storage.delete_file, file_path)
+            except Exception:
+                log.debug('dedupe: blob não removido para %s', file_hash, exc_info=True)
+            log.info('upload deduplicated: %s -> existing file %s', name, existing.id)
+            file_item = existing
+            file_path = existing.path
+        else:
+            file_item = await Files.insert_new_file(
+                user.id,
+                FileForm(
+                    **{
+                        'id': id,
+                        'filename': name,
+                        'path': file_path,
+                        'data': {
+                            **({'status': 'pending'} if process else {}),
+                        },
+                        'meta': {
+                            'name': name,
+                            'content_type': (file.content_type if isinstance(file.content_type, str) else None),
+                            'size': len(contents),
+                            'file_hash': file_hash,
+                            'data': file_metadata,
+                        },
+                    }
+                ),
+                db=db,
+            )
 
         if 'channel_id' in file_metadata:
-            channel = await Channels.get_channel_by_id_and_user_id(file_metadata['channel_id'], user.id, db=db)
-            if channel:
-                await Channels.add_file_to_channel_by_id(channel.id, file_item.id, user.id, db=db)
+            try:
+                channel = await Channels.get_channel_by_id_and_user_id(
+                    file_metadata['channel_id'], user.id, db=db
+                )
+                if channel:
+                    await Channels.add_file_to_channel_by_id(channel.id, file_item.id, user.id, db=db)
+            except Exception:
+                log.warning('channel link failed for %s', file_item.id, exc_info=True)
 
         if process:
             if background_tasks and process_in_background:
