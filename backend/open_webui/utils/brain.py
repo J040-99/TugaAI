@@ -877,6 +877,8 @@ Regras:
 - Responde DIRECTAMENTE à pergunta em2 a5 frases, em português de Portugal.
 - Usa APENAS a memória abaixo: NÃO uses pesquisa web nem conhecimento externo.
 - NÃO escrevas o teu processo de pensamento, nem passos, nem listas de inventário.
+- Quando peruntarem "como", dá um EXEMPLO PRÁCTICO real (comando, trecho de
+  código, passos concretos) tirado dos trechos dos documentos.
 - Se a resposta não estiver na memória, diz claramente que não te lembras disso.
 - Cita no máximo2-3 documentos relevantes entre [ ] (as fontes aparecem à parte).
 - Nunca inventes factos que não estejam no material.
@@ -890,12 +892,17 @@ Regras:
 ### Fichas relevantes
 {cards}
 
+### Trechos do conteúdo real dos documentos (fonte para exemplos concretos)
+{excerpts}
+
 ### Pergunta do utilizador
 {question}
 """
 
 
-def build_ask_prompt(question: str, state: dict, cards: list[dict], user=None) -> str:
+def build_ask_prompt(
+    question: str, state: dict, cards: list[dict], user=None, excerpts: list | None = None
+) -> str:
     """Prompt da conversa com o cérebro (função pura, testável)."""
     stats = (state or {}).get('stats') or {}
     stats_line = (
@@ -917,14 +924,39 @@ def build_ask_prompt(question: str, state: dict, cards: list[dict], user=None) -
         lines.append(line)
     cards_block = '\n'.join(lines) if lines else '(nenhuma ficha corresponde à pergunta)'
 
+    excerpt_parts = [
+        f'## [{name}]\n{text.strip()}' for name, text in (excerpts or []) if text and text.strip()
+    ]
+    excerpts_block = '\n\n'.join(excerpt_parts) or '(sem trechos disponíveis)'
+
     owner = getattr(user, 'name', None) or 'o utilizador'
     return (
         ASK_PROMPT_TEMPLATE.replace('{memory_index}', memory_index)
         .replace('{stats}', stats_line)
         .replace('{cards}', cards_block)
+        .replace('{excerpts}', excerpts_block)
         .replace('{question}', question.strip())
         .replace('{owner}', owner)
     )
+
+
+async def _load_excerpts(matched: list, limit: int = 4) -> list:
+    """Trechos do conteúdo REAL dos documentos mais relevantes (exemplos)."""
+    from open_webui.models.files import Files
+
+    excerpts: list = []
+    for card in matched[:limit]:
+        try:
+            file = await Files.get_file_by_id(card.get('id'))
+        except Exception:
+            continue
+        data = getattr(file, 'data', None) if file else None
+        content = data.get('content') if isinstance(data, dict) else None
+        if isinstance(content, str) and content.strip():
+            excerpts.append(
+                (card.get('filename') or 'documento', content.strip()[:BRAIN_ASK_EXCERPT_CHARS])
+            )
+    return excerpts
 
 
 async def answer_question(request, question: str, user) -> dict | None:
@@ -943,13 +975,17 @@ async def answer_question(request, question: str, user) -> dict | None:
             if len(matched) >= 15:
                 break
 
+    # Conteúdo real dos documentos mais relevantes — é ele que permite
+    # exemplos prâcticos (SQL, passos, …) em vez de só resumos.
+    excerpts = await _load_excerpts(matched)
+
     models = getattr(request.app.state, 'MODELS', None) or {}
     model = resolve_model(user, 'organize', models)
     if not model:
         log.debug('brain: no model available to answer questions')
         return None
 
-    prompt = build_ask_prompt(question, state, matched, user)
+    prompt = build_ask_prompt(question, state, matched, user, excerpts=excerpts)
     form_data = {
         'model': model,
         'messages': [{'role': 'user', 'content': prompt}],
@@ -1315,6 +1351,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
 ##########################################
 
 BRAIN_PDF_MAX_PAGES = int(os.getenv('BRAIN_PDF_MAX_PAGES', '3'))
+BRAIN_ASK_EXCERPT_CHARS = int(os.getenv('BRAIN_ASK_EXCERPT_CHARS', '4000'))
 BRAIN_PDF_ZOOM = 1.5  # ~108 dpi — bom equilíbrio entre detalhe e tamanho
 
 PDF_VISION_PROMPT = (

@@ -424,3 +424,20 @@ def test_card_matches_by_keyword_not_only_full_phrase():
         'brain': {'title': 'Receitas', 'summary': 'Bolo de chocolate.', 'tags': [], 'entities': []},
     }
     assert not card_matches(outro, q='Como cria uma base de dados?')
+
+
+def test_ask_prompt_includes_document_excerpts_for_practical_answers():
+    from open_webui.utils.brain import build_ask_prompt
+
+    prompt = build_ask_prompt(
+        'Como cria uma tabela?',
+        {'memory_index': 'Base de dados.', 'stats': {}},
+        [],
+        None,
+        excerpts=[('mysql.pdf', 'CREATE TABLE alunos (id INT PRIMARY KEY, nome TEXT);')],
+    )
+    assert '## [mysql.pdf]' in prompt
+    assert 'CREATE TABLE alunos' in prompt
+    # Sem trechos → bloco explicito
+    vazio = build_ask_prompt('x', {'memory_index': 'y', 'stats': {}}, [], None)
+    assert 'sem trechos disponíveis' in vazio
