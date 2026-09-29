@@ -652,8 +652,10 @@ async def run_reflection(app) -> dict:
         return state
 
     models = getattr(app.state, 'MODELS', None) or {}
-    model = BRAIN_MODEL or next(iter(models), None)
-    user = await _brain_system_user() if model else None
+    user = await _brain_system_user()
+    model = (
+        resolve_model(user, 'organize', models) if user else (BRAIN_MODEL or next(iter(models), None))
+    )
 
     if model and user:
         form_data = {
@@ -756,11 +758,7 @@ def resolve_model(user, function: str, models: dict) -> str | None:
     Funções: ``organize`` (ficha dos ficheiros) e ``vision`` (imagens + PDFs
     ilegíveis). A reflexão é global (sem utilizador) e continua a usar o env.
     """
-    settings = getattr(user, 'settings', None)
-    if settings is None:
-        settings = {}
-    elif not isinstance(settings, dict) and hasattr(settings, 'model_dump'):
-        settings = settings.model_dump()  # UserSettings (pydantic)
+    settings = _user_settings_dict(user)
 
     brain_settings = settings.get('brain') if isinstance(settings, dict) else None
     if isinstance(brain_settings, dict):
@@ -769,20 +767,51 @@ def resolve_model(user, function: str, models: dict) -> str | None:
             return chosen.strip()
 
     if function == 'vision':
-        return pick_vision_model(models)
-    return BRAIN_MODEL or (next(iter(models), None) if isinstance(models, dict) else None)
+        fallback = pick_vision_model(models)
+    else:
+        fallback = BRAIN_MODEL or (next(iter(models), None) if isinstance(models, dict) else None)
+    if fallback:
+        return fallback
+
+    # Sem catálogo no servidor (pool desativado): usa o primeiro modelo
+    # declarado na ligação direta do próprio cliente.
+    direct = settings.get('directConnections') if isinstance(settings, dict) else None
+    if isinstance(direct, dict):
+        configs = direct.get('OPENAI_API_CONFIGS') or {}
+        for index in sorted(configs.keys(), key=str):
+            model_ids = (configs.get(index) or {}).get('model_ids') or []
+            if model_ids:
+                return model_ids[0]
+
+    # Último recurso: modelo fixado no servidor (BRAIN_MODEL) — válido para
+    # qualquer ligação que o sirva, mesmo sem catálogo.
+    return BRAIN_MODEL or None
 
 
 def _user_settings_dict(user) -> dict:
-    """Settings do utilizador como dict (aceita UserSettings do pydantic)."""
+    """Settings do utilizador como dict (aceita UserSettings do pydantic).
+
+    O frontend guarda as preferências pessoais sob ``ui`` (``saveSettings``),
+    por isso as ligações diretas podem viver em ``settings.ui.directConnections``
+    — e também no topo. Devolve um dict com ambos os níveis (topo vence).
+    """
     settings = getattr(user, 'settings', None)
     if settings is None:
+        settings = {}
+    elif isinstance(settings, dict):
+        pass
+    elif hasattr(settings, 'model_dump'):
+        settings = settings.model_dump()
+    else:
         return {}
-    if isinstance(settings, dict):
-        return settings
-    if hasattr(settings, 'model_dump'):
-        return settings.model_dump()
-    return {}
+
+    if not isinstance(settings, dict):
+        return {}
+
+    ui = settings.get('ui')
+    if isinstance(ui, dict):
+        return {**ui, **settings}
+    return settings
 
 
 def direct_provider_for(settings: dict, model_id: str) -> tuple[str, str] | None:
@@ -820,7 +849,11 @@ def direct_provider_for(settings: dict, model_id: str) -> tuple[str, str] | None
 
 
 async def _post_chat(base_url: str, api_key: str, payload: dict) -> str | None:
-    """POST direto ao provedor do cliente (sem gate de pool, sem WebSocket)."""
+    """POST direto ao provedor do cliente (sem gate de pool, sem WebSocket).
+
+    Os pools gratuitos devolvem 429 com frequência — repetimos com backoff
+    curto (3 tentativas, Retry-After respeitado) antes de desistir.
+    """
     import aiohttp
 
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -828,19 +861,35 @@ async def _post_chat(base_url: str, api_key: str, payload: dict) -> str | None:
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=180)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    body = (await response.text())[:300]
-                    log.warning('brain: provider HTTP %d from %s: %s', response.status, base_url, body)
-                    return None
-                data = await response.json()
-                return data['choices'][0]['message']['content']
-    except Exception:
-        log.warning('brain: direct provider call failed for %s', base_url, exc_info=True)
-        return None
+    delay = 1.0
+    for attempt in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=180)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status == 429 and attempt < 2:
+                        retry_after = response.headers.get('Retry-After')
+                        wait = min(10.0, float(retry_after)) if retry_after else delay
+                        log.info(
+                            'brain: provider rate limited (429); retrying in %.1fs (attempt %d/3)',
+                            wait,
+                            attempt + 2,
+                        )
+                        await asyncio.sleep(wait)
+                        delay *= 2
+                        continue
+
+                    if response.status >= 400:
+                        body = (await response.text())[:300]
+                        log.warning('brain: provider HTTP %d from %s: %s', response.status, base_url, body)
+                        return None
+
+                    data = await response.json()
+                    return data['choices'][0]['message']['content']
+        except Exception:
+            log.warning('brain: direct provider call failed for %s', base_url, exc_info=True)
+            return None
+    return None
 
 
 async def complete_with_provider(request, form_data: dict, user, model: str) -> str | None:

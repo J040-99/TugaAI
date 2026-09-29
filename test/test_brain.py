@@ -284,3 +284,28 @@ def test_direct_provider_skips_disabled_connections():
         }
     }
     assert direct_provider_for(settings, 'qualquer') == ('https://on.example/v1', 'k1')
+
+
+def test_client_settings_nested_under_ui():
+    """O frontend guarda directConnections sob settings.ui — tem de ser encontrado."""
+    from open_webui.utils.brain import _user_settings_dict, direct_provider_for, resolve_model
+
+    user = _FakeUser(
+        {
+            'ui': {
+                'directConnections': {
+                    'OPENAI_API_BASE_URLS': ['https://openrouter.ai/api/v1'],
+                    'OPENAI_API_KEYS': ['sk-x'],
+                    'OPENAI_API_CONFIGS': {'0': {'model_ids': ['google/gemma-4-26b-a4b-it:free']}},
+                }
+            }
+        }
+    )
+
+    merged = _user_settings_dict(user)
+    assert direct_provider_for(merged, 'google/gemma-4-26b-a4b-it:free') == (
+        'https://openrouter.ai/api/v1',
+        'sk-x',
+    )
+    # Sem catálogo de modelos no servidor → primeiro modelo da ligação do cliente
+    assert resolve_model(user, 'organize', {}) == 'google/gemma-4-26b-a4b-it:free'
