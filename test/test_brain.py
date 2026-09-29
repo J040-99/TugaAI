@@ -374,3 +374,53 @@ def test_reasoning_leak_is_rejected_and_prose_still_accepted():
              'de SQL, criacao de tabelas e consultas.')
     ok = parse_reflection_payload(prosa)
     assert ok is not None and 'base de dados' in ok['memory_index']
+
+
+def test_sanitize_answer_strips_leaked_reasoning():
+    from open_webui.utils.brain import sanitize_answer
+
+    leakado = ("Here's a thinking process:1. Analyze the question2. Check memory\n"
+               "A base de dados cria-se com CREATE TABLE e depois insere-se com INSERT.")
+    limpo = sanitize_answer(leakado)
+    assert limpo is not None
+    assert 'thinking process' not in limpo.lower()
+    assert 'CREATE TABLE' in limpo
+
+    # So pensamento (sem resposta util) → rejeitado
+    assert sanitize_answer("Here's a thinking process: only thinking here, nothing else") is None
+    # Resposta normal passa intacta
+    normal = 'Usa CREATE TABLE para criar a tabela e INSERT para inserir linhas.'
+    assert sanitize_answer(normal) == normal
+    assert sanitize_answer('') is None
+
+
+def test_sanitize_handles_analysis_style_leaks():
+    from open_webui.utils.brain import sanitize_answer
+
+    # Pensamento numerado sem o marcador classico → corta e aceita a resposta
+    sujo = 'Analyze User Input: ver a memoria\nCREATE TABLE cria a tabela e INSERT insere.'
+    limpo = sanitize_answer(sujo)
+    assert limpo is not None and 'CREATE TABLE' in limpo and 'Analyze' not in limpo
+
+    # So pensamento mesmo depois do corte → rejeitado
+    assert sanitize_answer('1. **Analyze User Input:**\nMore thinking, step by step, nothing else.') is None
+
+
+def test_card_matches_by_keyword_not_only_full_phrase():
+    from open_webui.utils.brain import card_matches
+
+    cartao = {
+        'filename': 'mysql-create.pdf',
+        'brain': {
+            'title': 'CREATE TABLE',
+            'summary': 'Passos para criar uma base de dados em MySQL.',
+            'tags': [],
+            'entities': [],
+        },
+    }
+    assert card_matches(cartao, q='Como cria uma base de dados?')  # token "dados"
+    outro = {
+        'filename': 'cozinha.pdf',
+        'brain': {'title': 'Receitas', 'summary': 'Bolo de chocolate.', 'tags': [], 'entities': []},
+    }
+    assert not card_matches(outro, q='Como cria uma base de dados?')

@@ -72,16 +72,45 @@ def _clean_str(value, limit: int) -> str:
     return ' '.join(value.split())[:limit]
 
 
+# Marcadores de "pensamento" do modelo a vazar para a resposta.
+REASONING_MARKERS = re.compile(
+    r'thinking process|let me think|analy[sz]e (user|the|this|question)|'
+    r'objective:|goal:|<think|step[- ]by[- ]step|\*\*analy',
+    re.I,
+)
+
+
 def _looks_like_reasoning(text: str) -> bool:
     """Resposta que é só "pensamento" do modelo a vazar — não serve de conteúdo."""
-    head = (text or '')[:400].lower()
-    return bool(
-        re.search(
-            r'thinking process|let me (think|analyz|analys)|analy[sz]e user request|'
-            r'<think|step[- ]by[- ]step|objective:.*goal:',
-            head,
-        )
-    )
+    head = (text or '')[:400]
+    return bool(REASONING_MARKERS.search(head))
+
+
+def sanitize_answer(text) -> str | None:
+    """Limpa a resposta do chat: remove pensamento vazado; None se inútil.
+
+    Corta a cabeça com marcas de raciocínio (ex.: "Here's a thinking process")
+    e desiste se mesmo assim parecer pensamento — melhor uma falha amigável
+    do que lixo na conversa.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    cleaned = text.strip()
+    fenced = re.match(r'^```(?:text|markdown)?\s*(.*?)\s*```$', cleaned, re.S)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+
+    match = REASONING_MARKERS.search(cleaned[:1500])
+    if match:
+        line_end = cleaned.find('\n', match.start())
+        cleaned = (cleaned[line_end + 1 :] if line_end != -1 else '').strip()
+        if _looks_like_reasoning(cleaned):
+            log.warning('brain: answer is still reasoning after cleanup — rejecting')
+            return None
+
+    cleaned = cleaned.strip()
+    return cleaned if len(cleaned) >= 10 else None
 
 
 def _normalise_tags(raw_tags) -> list[str]:
@@ -271,7 +300,12 @@ def card_matches(card: dict, q: str = '', category: str = '') -> bool:
         ]
         if part
     ).lower()
-    return text in haystack
+    if text in haystack:
+        return True
+    # Palavras-chave da pergunta (≥5 letras) — a correspondência literal
+    # falhava quando a pergunta e a ficha usam formulações diferentes.
+    keywords = [token for token in re.split(r'\W+', text) if len(token) >= 5]
+    return any(token in haystack for token in keywords)
 
 
 async def query_brain_cards(
@@ -830,9 +864,11 @@ conhecimento pessoal. Responde em português de Portugal, raciocinando à frente
 com base APENAS no material abaixo (não inventes).
 
 Regras:
+- Responde DIRECTAMENTE à pergunta em2 a5 frases, em português de Portugal.
+- NÃO escrevas o teu processo de pensamento, nem passos, nem listas de inventário.
 - Se a resposta não estiver na memória, diz claramente que não te lembras disso.
-- Cita os documentos relevantes pelo nome entre [ ].
-- Sê directo e útil; podes ligar factos de documentos diferentes.
+- Cita no máximo2-3 documentos relevantes entre [ ] (as fontes aparecem à parte).
+- Nunca inventes factos que não estejam no material.
 
 ### Índice de memória (visão geral)
 {memory_index}
@@ -908,7 +944,7 @@ async def answer_question(request, question: str, user) -> dict | None:
         'messages': [{'role': 'user', 'content': prompt}],
         'stream': False,
         'temperature': 0.3,
-        'max_tokens': 1500,
+        'max_tokens': 2500,
     }
 
     try:
@@ -917,7 +953,8 @@ async def answer_question(request, question: str, user) -> dict | None:
         log.warning('brain: question answering failed', exc_info=True)
         return None
 
-    if not isinstance(answer, str) or not answer.strip():
+    answer = sanitize_answer(answer)
+    if not answer:
         return None
 
     log.info('brain: question answered by %s (%d chars)', model, len(answer))
@@ -1102,6 +1139,13 @@ async def _post_chat(base_url: str, api_key: str, payload: dict) -> str | None:
     headers = {'Content-Type': 'application/json'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
+
+    payload = dict(payload)
+    if 'openrouter.ai' in base_url and 'reasoning' not in payload:
+        # OpenRouter: desliga o raciocínio — o nemotron gastava TODO o
+        # orçamento de tokens a "pensar" e a resposta nunca chegava.
+        # (Só a este provedor; os outros recebem o payload intacto.)
+        payload['reasoning'] = {'effort': 'none'}
 
     delay = 1.0
     for attempt in range(3):
