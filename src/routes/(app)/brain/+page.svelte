@@ -8,6 +8,7 @@
 	import { toast } from 'svelte-sonner';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
 
 	const i18n = getContext('i18n');
 
@@ -401,9 +402,9 @@
 								<div class="text-xs font-semibold text-gray-500 dark:text-gray-400">
 									{item.q}
 								</div>
-								<p class="mt-1 whitespace-pre-wrap text-sm text-gray-700 dark:text-gray-200">
-									{item.a}
-								</p>
+								<div class="mt-1 text-sm text-gray-700 dark:text-gray-200">
+									<Markdown content={item.a} />
+								</div>
 								{#if item.sources.length > 0}
 									<div class="mt-1.5 text-xs text-gray-400 dark:text-gray-500">
 										{$i18n.t('Sources')}: {item.sources.join(' · ')}

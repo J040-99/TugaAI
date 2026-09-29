@@ -109,6 +109,16 @@ def sanitize_answer(text) -> str | None:
             log.warning('brain: answer is still reasoning after cleanup — rejecting')
             return None
 
+    # O modelo às vezes devolve a resposta dentro de JSON ({"answer": "..."}).
+    if cleaned.startswith('{'):
+        obj = _load_json_object(cleaned)
+        if isinstance(obj, dict):
+            for key in ('answer', 'response', 'content', 'text', 'resultado'):
+                value = obj.get(key)
+                if isinstance(value, str) and value.strip():
+                    cleaned = value.strip()
+                    break
+
     cleaned = cleaned.strip()
     return cleaned if len(cleaned) >= 10 else None
 
@@ -865,6 +875,7 @@ com base APENAS no material abaixo (não inventes).
 
 Regras:
 - Responde DIRECTAMENTE à pergunta em2 a5 frases, em português de Portugal.
+- Usa APENAS a memória abaixo: NÃO uses pesquisa web nem conhecimento externo.
 - NÃO escrevas o teu processo de pensamento, nem passos, nem listas de inventário.
 - Se a resposta não estiver na memória, diz claramente que não te lembras disso.
 - Cita no máximo2-3 documentos relevantes entre [ ] (as fontes aparecem à parte).
