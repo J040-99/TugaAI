@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext, onMount } from 'svelte';
+	import { getContext, onMount, onDestroy } from 'svelte';
 	import dayjs from '$lib/dayjs';
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
@@ -100,6 +100,9 @@
 	const CHAT_KEY = 'tugaai.brain.chat.v1';
 	let question = '';
 	let asking = false;
+	let askStartedAt = 0;
+	let elapsed = 0;
+	let ticker: ReturnType<typeof setInterval> | undefined;
 	let chat: { q: string; a: string; sources: string[] }[] = [];
 
 	// Gestor de informação (ficheiros do cérebro)
@@ -139,6 +142,8 @@
 		const q = question.trim();
 		if (!q || asking) return;
 		asking = true;
+		askStartedAt = Date.now();
+		elapsed = 0;
 		try {
 			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/ask`, {
 				method: 'POST',
@@ -274,6 +279,13 @@
 		restoreChat();
 		loadPage(1, false);
 		loadBrainSettings();
+		ticker = setInterval(() => {
+			if (asking) elapsed = Math.floor((Date.now() - askStartedAt) / 1000);
+		}, 1000);
+	});
+
+	onDestroy(() => {
+		if (ticker) clearInterval(ticker);
 	});
 
 	$: filtered = cards.filter((card) => {
@@ -523,11 +535,16 @@
 
 				<!-- Barra de carregamento enquanto o cérebro raciocina -->
 				{#if asking}
+					<p class="mt-2 text-xs text-gray-400 dark:text-gray-500">
+						{$i18n.t('Thinking…')}{elapsed > 0 ? ` (${elapsed}s)` : ''}
+					</p>
 					<div
 						class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800"
 						role="progressbar"
 					>
-						<div class="h-full w-2/5 animate-pulse rounded-full bg-gray-900 dark:bg-white"></div>
+						<div
+							class="brain-bar-indeterminate h-full w-2/5 rounded-full bg-gray-900 dark:bg-white"
+						></div>
 					</div>
 				{/if}
 
@@ -892,3 +909,21 @@
 		</div>
 	</div>
 </div>
+
+<style>
+	/* Barra indeterminada: desliza continuamente da esquerda para a direita —
+	   o simple pulse dava a sensação de "parado" e parecia um erro. */
+	@keyframes brain-bar-slide {
+		0% {
+			transform: translateX(-110%);
+		}
+		100% {
+			transform: translateX(280%);
+		}
+	}
+
+	.brain-bar-indeterminate {
+		animation: brain-bar-slide 1.3s ease-in-out infinite;
+		will-change: transform;
+	}
+</style>
