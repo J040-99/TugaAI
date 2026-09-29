@@ -165,7 +165,9 @@ def _load_json_object(text: str) -> dict | None:
 
     tail = text[start:]
     decoder = json.JSONDecoder()
-    for candidate in (tail, re.sub(r',(\s*[}\]])', r'\1', tail)):
+    # 1) bruto · 2) sem vírgulas finais · 3) chaves sem aspas ({ title: ... })
+    bare_keys = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', tail)
+    for candidate in (tail, re.sub(r',(\s*[}\]])', r'\1', tail), bare_keys):
         try:
             data, _ = decoder.raw_decode(candidate)
         except json.JSONDecodeError:
@@ -745,12 +747,38 @@ async def _recent_cards(limit: int) -> list[dict]:
     return [card for _, _, card in sorted(heap, key=lambda item: item[0], reverse=True)]
 
 
+def _is_garbage_card(brain: dict) -> bool:
+    """Ficha deteoriorada (pensamento vazado, JSON cru, lixo repetido).
+
+    Cartões criados antes dos guardas podem ter title/summary com o raciocínio
+    do modelo ou o JSON truncado como texto — a auto-sanagem reorganiza-os.
+    """
+    if not isinstance(brain, dict):
+        return True
+    title = str(brain.get('title') or '')
+    summary = str(brain.get('summary') or '')
+    text = f'{title} {summary}'
+
+    if _looks_like_reasoning(text):
+        return True
+    if title.lstrip().startswith('{') or summary.lstrip().startswith('{'):
+        return True
+    if '"title"' in title or '"summary"' in title or '"tags"' in summary:
+        return True
+    # Lixo repetido (ex.: "deepseek-ai deepseek-ai …") → poucas palavras únicas
+    words = re.findall(r'\w+', text.lower())
+    if len(words) >= 12 and len(set(words)) <= 6:
+        return True
+    return False
+
+
 async def _organize_if_pending(file, request) -> bool:
-    """Organiza um ficheiro que ainda não tem ficha. True se criou ficha."""
+    """Organiza um ficheiro sem ficha (ou com ficha deteoriorada). True se mudou."""
     from open_webui.models.users import Users
 
     data = file.data if isinstance(file.data, dict) else {}
-    if data.get('brain'):
+    brain_card = data.get('brain')
+    if brain_card and not _is_garbage_card(brain_card):
         return False
     content = data.get('content')
     if not isinstance(content, str) or len(content.strip()) < 40:

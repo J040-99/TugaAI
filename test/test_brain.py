@@ -441,3 +441,22 @@ def test_ask_prompt_includes_document_excerpts_for_practical_answers():
     # Sem trechos → bloco explicito
     vazio = build_ask_prompt('x', {'memory_index': 'y', 'stats': {}}, [], None)
     assert 'sem trechos disponíveis' in vazio
+
+
+def test_garbage_cards_are_detected_for_self_healing():
+    from open_webui.utils.brain import _is_garbage_card
+
+    # Lixos reais vistos na página /brain
+    assert _is_garbage_card({'title': "Here's a thinking process:1. **Analyze the Request:**", 'summary': 'x'})
+    assert _is_garbage_card(
+        {'title': 'MySQL DROP TABLE', 'summary': '{ "title": "MySQL DROP TABLE", "summary": "The doc'}
+    )
+    assert _is_garbage_card({
+        'title': 'Here inellsells whereells deepseek-ai deepseek-ai deepseek-ai',
+        'summary': 'deepseek-ai deepseek-ai deepseek-ai deepseek-ai deepseek-ai',
+    })
+    # Fichas boas ficam intactas
+    assert not _is_garbage_card(
+        {'title': 'MySQL CREATE TABLE Statement', 'summary': 'Explains the CREATE TABLE syntax.'}
+    )
+    assert not _is_garbage_card({'title': 'Passeio a serra', 'summary': 'Subi a Serra da Estrela com a Maria.'})
