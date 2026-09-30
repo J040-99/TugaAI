@@ -122,19 +122,19 @@
 <section
 	class="mb-6 rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"
 >
-	<div class="flex items-center justify-between gap-3">
+	<div>
 		<h2 class="text-sm font-semibold text-gray-900 dark:text-white">
 			{$i18n.t('Information manager')}
 		</h2>
-		<div class="flex items-center gap-2">
+		<div class="mt-2 flex flex-wrap gap-2">
 			<button
-				class="rounded-xl border border-amber-200 px-3 py-1.5 text-xs font-medium text-amber-700 transition hover:bg-amber-50 disabled:opacity-60 dark:border-amber-500/30 dark:text-amber-300"
+				class="shrink-0 whitespace-nowrap rounded-xl border border-amber-200 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition hover:bg-amber-50 disabled:opacity-60 dark:border-amber-500/30 dark:text-amber-300"
 				on:click={cleanupDuplicates}
 			>
-				{$i18n.t('Clean duplicates')}
+				{$i18n.t('Remove duplicates')}
 			</button>
 			<button
-				class="rounded-xl bg-gray-900 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-gray-800 disabled:opacity-60 dark:bg-white dark:text-gray-900"
+				class="shrink-0 whitespace-nowrap rounded-xl bg-gray-900 px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-gray-800 disabled:opacity-60 dark:bg-white dark:text-gray-900"
 				disabled={uploading}
 				on:click={() => fileInput?.click()}
 			>
@@ -148,30 +148,33 @@
 		{#each cards as card (card.id)}
 			<div class="rounded-xl border border-gray-100 p-2.5 dark:border-gray-800">
 				<div class="flex flex-wrap items-center gap-2">
-					<span class="min-w-0 flex-1 truncate text-sm text-gray-800 dark:text-gray-100">
+					<span class="block w-full truncate text-sm text-gray-800 dark:text-gray-100">
 						{card.filename}
 					</span>
 					{#if (dupCounts.get(card.hash ?? card.id) ?? 0) > 1}
 						<span
-							class="rounded bg-amber-100 px-1.5 py-0.5 text-[0.625rem] font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+							class="shrink-0 whitespace-nowrap rounded bg-amber-100 px-1.5 py-0.5 text-[0.625rem] font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
 						>
 							{$i18n.t('Duplicate')} ×{dupCounts.get(card.hash ?? card.id)}
 						</span>
 					{/if}
+				</div>
+
+				<div class="mt-1.5 flex flex-wrap gap-1.5">
 					<button
-						class="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+						class="whitespace-nowrap rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
 						on:click={() => reorganiseFile(card.id)}
 					>
 						{$i18n.t('Reorganise')}
 					</button>
 					<button
-						class="rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+						class="whitespace-nowrap rounded-lg bg-gray-100 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
 						on:click={() => startEditCard(card)}
 					>
 						{$i18n.t('Edit')}
 					</button>
 					<button
-						class="rounded-lg bg-red-50 px-2 py-1 text-xs text-red-600 transition hover:bg-red-100 dark:bg-red-500/10 dark:text-red-400"
+						class="whitespace-nowrap rounded-lg bg-red-50 px-2 py-1 text-xs text-red-600 transition hover:bg-red-100 dark:bg-red-500/10 dark:text-red-400"
 						on:click={() => deleteFile(card.id, card.filename)}
 					>
 						{$i18n.t('Delete')}
