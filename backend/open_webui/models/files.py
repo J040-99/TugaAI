@@ -270,6 +270,35 @@ class FilesTable:
             file = result.scalars().first()
             return FileModel.model_validate(file) if file else None
 
+    async def get_duplicate_candidates(
+        self, skip: int = 0, limit: int = 100, db: AsyncSession | None = None
+    ) -> list[dict]:
+        """Metadados ligeiros para dedupe (o FileModelResponse não traz meta).
+
+        Devolve id, user_id, filename, hash do texto e hash dos BYTES
+        (meta.file_hash) — o que permite agrupar também imagens/HEIC.
+        """
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(File.id, File.user_id, File.filename, File.hash, File.meta)
+                .order_by(File.id)
+                .offset(skip)
+                .limit(limit)
+            )
+            rows = []
+            for row in result.all():
+                meta = row[4] if isinstance(row[4], dict) else {}
+                rows.append(
+                    {
+                        'id': row[0],
+                        'user_id': row[1],
+                        'filename': row[2],
+                        'hash': row[3],
+                        'meta_file_hash': meta.get('file_hash'),
+                    }
+                )
+            return rows
+
     async def get_file_list(
         self,
         user_id: str | None = None,

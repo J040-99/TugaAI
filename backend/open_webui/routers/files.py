@@ -769,20 +769,27 @@ async def cleanup_duplicates(
     storage e eventos). Sem admin, só opera sobre ficheiros do próprio.
     """
     # Passa as páginas (memória limitada) e guarda só metadados ligeiros.
+    # Chave: hash dos BYTES (meta.file_hash) — apanha imagens/HEIC sem hash
+    # de texto; fallback para o hash do texto extraído; depois o id.
     groups: dict[str, list] = {}
     skip = 0
     while True:
-        page = await Files.get_file_list(skip=skip, limit=100, db=db)
-        if not page.items:
+        items = await Files.get_duplicate_candidates(skip=skip, limit=100, db=db)
+        if not items:
             break
-        for item in page.items:
-            key = item.hash or item.id
+        for item in items:
+            if item['meta_file_hash']:
+                key = f"bytes:{item['meta_file_hash']}"
+            elif item['hash']:
+                key = f"text:{item['hash']}"
+            else:
+                key = f"id:{item['id']}"
             groups.setdefault(key, []).append(
-                {'id': item.id, 'user_id': item.user_id, 'filename': item.filename}
+                {'id': item['id'], 'user_id': item['user_id'], 'filename': item['filename']}
             )
-        skip += len(page.items)
-        if page.total is not None and skip >= page.total:
+        if len(items) < 100:
             break
+        skip += len(items)
 
     deleted = 0
     removed_names: list[str] = []
@@ -792,17 +799,44 @@ async def cleanup_duplicates(
         if user.role != 'admin' and any(c['user_id'] != user.id for c in copies):
             continue  # nunca mexe em ficheiros de outros utilizadores
 
+        # Ligações à knowledge de CADA cópia — guardam-se antes de apagar
+        # para que nenhuma colecção perca o ficheiro.
+        links: dict[str, list] = {}
+        for copy in copies:
+            links[copy['id']] = await Knowledges.get_knowledges_by_file_id(copy['id'], db=db) or []
+
         # Manter: preferencialmente um com ligação a knowledge; senão o primeiro.
         keep = copies[0]
         for copy in copies:
-            knowledges = await Knowledges.get_knowledges_by_file_id(copy['id'], db=db)
-            if knowledges:
+            if links[copy['id']]:
                 keep = copy
                 break
+        keep_knowledge_ids = {k.id for k in links[keep['id']]}
 
         for copy in copies:
             if copy['id'] == keep['id']:
                 continue
+            # Preserva as knowledge da cópia que vai ser apagada: re-liga-as
+            # à que fica (o DELETE limpa as associações do ficheiro antigo).
+            for knowledge in links[copy['id']]:
+                if knowledge.id in keep_knowledge_ids:
+                    continue
+                try:
+                    await Knowledges.add_file_to_knowledge_by_id(
+                        knowledge_id=knowledge.id,
+                        file_id=keep['id'],
+                        user_id=copy['user_id'],
+                        directory_id=None,
+                        db=db,
+                    )
+                    keep_knowledge_ids.add(knowledge.id)
+                except Exception:
+                    log.warning(
+                        'cleanup-duplicates: could not move knowledge %s to %s',
+                        knowledge.id,
+                        keep['id'],
+                        exc_info=True,
+                    )
             try:
                 result = await delete_file_by_id(request, copy['id'], user, db=db)
                 if isinstance(result, dict) and result.get('message'):

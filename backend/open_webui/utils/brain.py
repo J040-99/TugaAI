@@ -252,7 +252,9 @@ def build_brain_card(file) -> dict | None:
     return {
         'id': file.id,
         'filename': file.filename,
-        'hash': getattr(file, 'hash', None),
+        # Chave de duplicados: bytes primeiro (a panha imagens sem hash de texto)
+        'hash': ((file.meta or {}).get('file_hash') if isinstance(file.meta, dict) else None)
+        or getattr(file, 'hash', None),
         'created_at': file.created_at,
         'updated_at': file.updated_at,
         'brain': {
