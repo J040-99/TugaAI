@@ -199,6 +199,26 @@ export const embed = writable(null);
 
 export const temporaryChatEnabled = writable(false);
 
+const BRAIN_MODE_KEY = 'tugaai.brain.mode';
+
+const readBrainMode = (): boolean => {
+	try {
+		return localStorage.getItem(BRAIN_MODE_KEY) === 'true';
+	} catch {
+		return false;
+	}
+};
+
+export const brainMode = writable(readBrainMode());
+
+brainMode.subscribe((enabled) => {
+	try {
+		localStorage.setItem(BRAIN_MODE_KEY, enabled ? 'true' : 'false');
+	} catch {
+		return;
+	}
+});
+
 // Transient one-shot event from the desktop shell (Spotlight, drag-and-drop, etc.).
 // Set by +layout.svelte, consumed and cleared by Chat.svelte.
 export type DesktopEventFile = { name: string; mimeType: string; dataUrl: string };

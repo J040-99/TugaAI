@@ -3,7 +3,6 @@
 	import dayjs from '$lib/dayjs';
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
-	import BrainChat from '$lib/components/brain/BrainChat.svelte';
 	import BrainManager from '$lib/components/brain/BrainManager.svelte';
 	import BrainModels from '$lib/components/brain/BrainModels.svelte';
 	import BrainReflection from '$lib/components/brain/BrainReflection.svelte';
@@ -227,9 +226,6 @@
 
 			<!-- Reflexão periódica: o que o cérebro "pensou" na última revisão -->
 			<BrainReflection {reflection} />
-
-			<!-- Chat com o cérebro (histórico guardado no servidor) -->
-			<BrainChat />
 
 			<!-- Modelos por função — escolha deste cliente -->
 			<BrainModels />

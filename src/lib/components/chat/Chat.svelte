@@ -46,7 +46,8 @@
 		showFileNavPath,
 		showFileNavDir,
 		chatRequestQueues,
-		desktopEvent
+		desktopEvent,
+		brainMode
 	} from '$lib/stores';
 	import { refreshChatList, refreshFolderChatLists } from '$lib/stores/chatList';
 
@@ -3072,6 +3073,129 @@
 	// Chat functions
 	//////////////////////////
 
+	const askBrain = async (question: string) => {
+		const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/ask`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${localStorage.token}`,
+				'Content-Type': 'application/json'
+			},
+			credentials: 'include',
+			body: JSON.stringify({ question })
+		});
+
+		if (!res.ok) {
+			throw new Error(`brain request failed with status ${res.status}`);
+		}
+
+		return await res.json();
+	};
+
+	const brainSourcesToCitations = (sources: any) =>
+		(Array.isArray(sources) ? sources : [])
+			.filter((source) => typeof source === 'string' && source.trim() !== '')
+			.map((name) => ({
+				source: { id: name, name },
+				document: [name],
+				metadata: [{ source: name, name }]
+			}));
+
+	const sendBrainMessage = async (parentId: string) => {
+		if (autoScroll) {
+			scrollToBottom();
+		}
+
+		const question = history.messages[parentId]?.content ?? '';
+		const modelId =
+			atSelectedModel !== undefined ? atSelectedModel.id : (selectedModels ?? []).at(0);
+		const model = $models.filter((m) => m.id === modelId).at(0);
+
+		const responseMessageId = uuidv4();
+		const responseMessage: any = {
+			parentId,
+			id: responseMessageId,
+			childrenIds: [],
+			role: 'assistant',
+			content: '',
+			done: false,
+			model: model?.id ?? modelId,
+			modelName: model?.name ?? model?.id ?? modelId,
+			modelIdx: 0,
+			timestamp: Math.floor(Date.now() / 1000),
+			statusHistory: [{ action: 'brain_think', description: $i18n.t('Asking the brain…') }]
+		};
+
+		history.messages[responseMessageId] = responseMessage;
+		history.currentId = responseMessageId;
+		if (parentId !== null && history.messages[parentId]) {
+			history.messages[parentId].childrenIds = [
+				...history.messages[parentId].childrenIds,
+				responseMessageId
+			];
+		}
+		history = history;
+
+		await tick();
+
+		generating = true;
+
+		try {
+			let _chatId = JSON.parse(JSON.stringify($chatId));
+
+			if (!_chatId) {
+				if (embedded && onCreateEmbeddedChat) {
+					const createdChat = await onCreateEmbeddedChat();
+					if (!createdChat?.id) {
+						throw new Error('failed to create chat');
+					}
+
+					chat = createdChat;
+					_chatId = createdChat.id;
+					loadedChatIdProp = _chatId;
+					await chatId.set(_chatId);
+					await chatTitle.set(createdChat?.chat?.title ?? createdChat?.title ?? $i18n.t('Chat'));
+					params = structuredClone(createdChat?.chat?.params ?? {});
+					delete params.note_id;
+					chatFiles = mergeFiles(chatFiles, createdChat?.chat?.files ?? []);
+					await onSelectEmbeddedChat?.(_chatId);
+				} else {
+					_chatId = await initChatHandler(history);
+				}
+				await tick();
+			}
+
+			const data = await askBrain(question);
+
+			responseMessage.content = data?.answer ?? '';
+			responseMessage.sources = brainSourcesToCitations(data?.sources);
+		} catch (error) {
+			console.error(error);
+
+			const errorMessage = $i18n.t('Uh-oh! There was an issue with the response.');
+			toast.error(errorMessage);
+
+			responseMessage.error = { content: errorMessage, raw: error };
+		} finally {
+			responseMessage.statusHistory = [];
+			responseMessage.done = true;
+			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+			history = history;
+			generating = false;
+		}
+
+		await tick();
+
+		if (shouldAutoScrollResponse()) {
+			scrollToBottom();
+		}
+
+		if ($chatId) {
+			await saveChatHandler($chatId, history);
+		}
+		await processNextInQueue($chatId);
+	};
+
 	const submitPrompt = async (inputContent, inputFiles) => {
 		const _files = structuredClone(inputFiles);
 
@@ -3116,6 +3240,11 @@
 		}
 
 		saveSessionSelectedModels();
+
+		if ($brainMode) {
+			await sendBrainMessage(userMessageId);
+			return;
+		}
 
 		await sendMessage(history, userMessageId);
 	};
@@ -3302,7 +3431,7 @@
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
 		}
-		if (selectedModels.includes('')) {
+		if (!$brainMode && selectedModels.includes('')) {
 			toast.error($i18n.t('Model not selected'));
 			return;
 		}

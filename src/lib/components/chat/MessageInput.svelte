@@ -41,7 +41,8 @@
 		showFileNavDir,
 		selectedTerminalId,
 		TTSWorker,
-		temporaryChatEnabled
+		temporaryChatEnabled,
+		brainMode
 	} from '$lib/stores';
 
 	import {
@@ -95,6 +96,7 @@
 	import XMark from '../icons/XMark.svelte';
 	import GlobeAlt from '../icons/GlobeAlt.svelte';
 	import Photo from '../icons/Photo.svelte';
+	import LightBulb from '../icons/LightBulb.svelte';
 	import Wrench from '../icons/Wrench.svelte';
 	import Cube from '../icons/Cube.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
@@ -841,6 +843,8 @@
 		selectedModelIds.length === codeInterpreterCapableModels.length &&
 		$config?.features?.enable_code_interpreter &&
 		($_user.role === 'admin' || $_user?.permissions?.features?.code_interpreter);
+
+	let showBrainModeButton = true;
 
 	// Disable code interpreter when terminal is active (mutually exclusive)
 	$: if ($selectedTerminalId && codeInterpreterEnabled) {
@@ -2091,7 +2095,11 @@
 															navigator.maxTouchPoints > 0 ||
 															navigator.msMaxTouchPoints > 0
 														)}
-													placeholder={placeholder ? placeholder : $i18n.t('Send a Message')}
+													placeholder={$brainMode
+														? $i18n.t('Ask the brain...')
+														: placeholder
+															? placeholder
+															: $i18n.t('Send a Message')}
 													largeTextAsFile={($settings?.largeTextAsFile ?? false) && !shiftKey}
 													autocomplete={$config?.features?.enable_autocomplete_generation &&
 														($settings?.promptAutocomplete ?? false)}
@@ -2307,20 +2315,23 @@
 										</button>
 									</InputMenu>
 
-									{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || showSkillsButton || (toggleFilters && toggleFilters.length > 0)}
+									{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showBrainModeButton || showToolsButton || showSkillsButton || (toggleFilters && toggleFilters.length > 0)}
 										<div
 											class="flex self-center w-[0.0625rem] h-4 mx-1 bg-gray-200/50 dark:bg-gray-800/50 shrink-0"
 										/>
 									{/if}
 
 									<div class="flex flex-1 items-center min-w-0 overflow-x-auto scrollbar-none">
-										{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || showSkillsButton || (toggleFilters && toggleFilters.length > 0)}
+										{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showBrainModeButton || showToolsButton || showSkillsButton || (toggleFilters && toggleFilters.length > 0)}
 											<IntegrationsMenu
 												selectedModels={selectedModelIds}
 												{toggleFilters}
 												{showWebSearchButton}
 												{showImageGenerationButton}
 												{showCodeInterpreterButton}
+												{showBrainModeButton}
+												brainModeEnabled={$brainMode}
+												onBrainModeToggle={(state: boolean) => brainMode.set(state)}
 												bind:selectedToolIds
 												bind:selectedSkillIds
 												bind:selectedFilterIds
@@ -2550,6 +2561,24 @@
 															: 'focus:outline-hidden rounded-full'}"
 													>
 														<Terminal className="size-3.5" strokeWidth="2" />
+
+														<div class="hidden group-hover:block">
+															<XMark className="size-4" strokeWidth="1.75" />
+														</div>
+													</button>
+												</Tooltip>
+											{/if}
+
+											{#if $brainMode}
+												<Tooltip content={$i18n.t('Talk to the brain')} placement="top">
+													<button
+														aria-label={$i18n.t('Talk to the brain')}
+														aria-pressed={$brainMode}
+														on:click|preventDefault={() => brainMode.set(false)}
+														type="button"
+														class="group p-[0.375rem] flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden text-sky-500 dark:text-sky-300 bg-sky-50 hover:bg-sky-100 dark:bg-sky-400/10 dark:hover:bg-sky-600/10 border border-sky-200/40 dark:border-sky-500/20"
+													>
+														<LightBulb className="size-4" strokeWidth="1.75" />
 
 														<div class="hidden group-hover:block">
 															<XMark className="size-4" strokeWidth="1.75" />
