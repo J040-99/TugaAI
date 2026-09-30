@@ -96,9 +96,10 @@ class PDFLoader(BaseLoader):
             if image_text:
                 text = self._merge_image_text(text, image_text)
         text = (text or '').strip()
-        if not text and self.extract_images and self._rendered_ocr < RENDER_OCR_MAX_PAGES:
-            # Página digitalizada sem texto nem imagens embutidas
-            # detectáveis: renderiza e faz OCR LOCAL (sem rede/modelo).
+        if not text and self._rendered_ocr < RENDER_OCR_MAX_PAGES:
+            # Página digitalizada sem NENHUM texto: renderiza e faz OCR LOCAL
+            # (offline, sem modelo). Independente de PDF_EXTRACT_IMAGES — um
+            # PDF scan devolver sempre vazio é o que fazia uploads falharem.
             self._rendered_ocr += 1
             text = ocr_pdf_text(self.file_path, pages=[index])
         return text
