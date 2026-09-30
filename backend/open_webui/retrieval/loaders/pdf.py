@@ -1,12 +1,81 @@
 import datetime as dt
 import io
 import logging
+import os
+import threading
 from pathlib import Path
 
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 
 log = logging.getLogger(__name__)
+
+# OCR local de páginas digitalizadas (renderiza com PyMuPDF → RapidOCR).
+# Cobertura: PDFs sem camada de texto E sem imagens embutidas detectáveis
+# (ex.: imagens dentro de Form XObjects). Env: PDF_RENDER_OCR_MAX_PAGES.
+RENDER_OCR_MAX_PAGES = int(os.getenv('PDF_RENDER_OCR_MAX_PAGES', '50'))
+_OCR_ZOOM = 1.5  # ~108 dpi — equilíbrio entre legibilidade e custo
+_ocr_engine = None
+_ocr_lock = threading.Lock()
+
+_PIXMAP_MODES = {1: 'L', 2: 'LA', 3: 'RGB', 4: 'RGBA'}
+
+
+def _pixels_from_pixmap(pixmap):
+    import numpy as np
+    from PIL import Image
+
+    mode = _PIXMAP_MODES.get(pixmap.n, 'RGB')
+    image = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples)
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    return np.array(image)
+
+
+def _get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        from rapidocr import RapidOCR
+
+        _ocr_engine = RapidOCR()
+    return _ocr_engine
+
+
+def ocr_pdf_text(file_path, pages=None, max_pages=RENDER_OCR_MAX_PAGES) -> str:
+    """OCR local de páginas de um PDF digitalizado (PyMuPDF + RapidOCR).
+
+    ``pages`` (lista de índices) processa só essas páginas; caso contrário as
+    primeiras ``max_pages``. Devolve '' se não houver OCR disponível ou texto —
+    nunca levanta exceção (é um caminho de recurso).
+    """
+    if not file_path:
+        return ''
+    try:
+        import pymupdf
+    except Exception:
+        log.warning('PDF OCR local: pymupdf indisponível', exc_info=True)
+        return ''
+
+    try:
+        with pymupdf.open(str(file_path)) as document:
+            if pages is None:
+                indexes = range(min(max_pages, document.page_count))
+            else:
+                indexes = [i for i in pages if 0 <= i < document.page_count]
+            texts = []
+            # Serializa: o motor OCR é CPU-bound e não é thread-safe.
+            with _ocr_lock:
+                engine = _get_ocr_engine()
+                for index in indexes:
+                    page = document.load_page(index)
+                    pixmap = page.get_pixmap(matrix=pymupdf.Matrix(_OCR_ZOOM, _OCR_ZOOM))
+                    result = engine(_pixels_from_pixmap(pixmap))
+                    if result and getattr(result, 'txts', None):
+                        texts.append('\n'.join(t for t in result.txts if t))
+            return '\n\n'.join(t for t in texts if t).strip()
+    except Exception:
+        log.warning('PDF OCR local falhou para %s', file_path, exc_info=True)
+        return ''
 
 
 class PDFLoader(BaseLoader):
@@ -17,6 +86,22 @@ class PDFLoader(BaseLoader):
         self.extract_images = extract_images
         self.mode = mode
         self.ocr = None
+        self._rendered_ocr = 0
+
+    def _page_text(self, page, index: int) -> str:
+        """Texto de uma página: pypdf → imagens embutidas → OCR local."""
+        text = page.extract_text()
+        if self.extract_images:
+            image_text = self._extract_images(page)
+            if image_text:
+                text = self._merge_image_text(text, image_text)
+        text = (text or '').strip()
+        if not text and self.extract_images and self._rendered_ocr < RENDER_OCR_MAX_PAGES:
+            # Página digitalizada sem texto nem imagens embutidas
+            # detectáveis: renderiza e faz OCR LOCAL (sem rede/modelo).
+            self._rendered_ocr += 1
+            text = ocr_pdf_text(self.file_path, pages=[index])
+        return text
 
     def lazy_load(self):
         from pypdf import PdfReader
@@ -41,12 +126,7 @@ class PDFLoader(BaseLoader):
             labels = reader.page_labels if self.mode == 'page' else None
             texts = []
             for index, page in enumerate(reader.pages):
-                text = page.extract_text()
-                if self.extract_images:
-                    image_text = self._extract_images(page)
-                    if image_text:
-                        text = self._merge_image_text(text, image_text)
-                text = text.strip()
+                text = self._page_text(page, index)
                 if self.mode == 'page':
                     yield Document(page_content=text, metadata={**metadata, 'page': index, 'page_label': labels[index]})
                 else:

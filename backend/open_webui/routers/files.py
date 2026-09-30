@@ -302,12 +302,27 @@ async def process_uploaded_file(
                 (file.content_type or '').lower() == 'application/pdf'
             )
             if is_pdf and ERROR_MESSAGES.EMPTY_CONTENT in error_text:
+                #1) OCR local primeiro — offline, barato, sem depender de
+                #    nenhum modelo (páginas digitalizadas que o loader não
+                #    apanhou: imagens embutidas em Form XObjects).
                 try:
-                    from open_webui.utils.brain import describe_pdf
+                    from open_webui.retrieval.loaders.pdf import ocr_pdf_text
+                    from open_webui.storage.provider import Storage
 
-                    description = await describe_pdf(request, file_path, file.content_type, user)
+                    resolved = await asyncio.to_thread(Storage.get_file, file_path)
+                    description = await asyncio.to_thread(ocr_pdf_text, resolved)
                 except Exception:
-                    log.exception('brain: PDF description failed for %s', file_item.id)
+                    description = None
+                    log.exception('brain: local PDF OCR failed for %s', file_item.id)
+
+                #2) Só depois: modelo de visão (renderiza as páginas).
+                if not description:
+                    try:
+                        from open_webui.utils.brain import describe_pdf
+
+                        description = await describe_pdf(request, file_path, file.content_type, user)
+                    except Exception:
+                        log.exception('brain: PDF description failed for %s', file_item.id)
 
             if description:
                 log.info(
@@ -804,6 +819,40 @@ async def cleanup_duplicates(
         'groups': sum(1 for copies in groups.values() if len(copies) > 1),
         'files': removed_names[:50],
     }
+
+
+@router.get('/brain/chat', response_model=dict)
+async def get_brain_chat_history(user=Depends(get_verified_user)):
+    """Histórico do chat com o cérebro — guardado no servidor, por utilizador."""
+    from open_webui.utils.brain import load_chat_history
+
+    return {'items': load_chat_history(user.id)}
+
+
+@router.put('/brain/chat', response_model=dict)
+async def put_brain_chat_history(request: Request, user=Depends(get_verified_user)):
+    """Substitui o histórico do chat (mais recente primeiro; validado)."""
+    from open_webui.utils.brain import save_chat_history
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='invalid JSON body')
+
+    items = payload.get('items') if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail='items must be a list')
+
+    return {'status': True, 'count': save_chat_history(user.id, items)}
+
+
+@router.delete('/brain/chat', response_model=dict)
+async def delete_brain_chat_history(user=Depends(get_verified_user)):
+    """Apaga o histórico do chat deste utilizador."""
+    from open_webui.utils.brain import clear_chat_history
+
+    clear_chat_history(user.id)
+    return {'status': True}
 
 
 @router.get('/search', response_model=list[FileModelResponse])

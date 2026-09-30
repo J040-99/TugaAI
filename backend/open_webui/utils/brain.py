@@ -422,10 +422,15 @@ async def organize_file(request, file_id: str, user) -> dict | None:
 
 async def _organize_safe(request, file_id: str, user) -> None:
     try:
-        await organize_file(request, file_id, user)
+        payload = await organize_file(request, file_id, user)
     except Exception:
         # O cérebro é um extra: nunca pode rebentar o upload de um ficheiro.
         log.exception('brain: background organisation failed for file %s', file_id)
+        return
+    if payload:
+        # Ficha nova criada → reflexão "on-demand": o índice e os insights
+        # não têm de esperar pelo ciclo de relógio (debounced, ver abaixo).
+        schedule_reflection(request.app)
 
 
 def schedule_organize(request, file_id: str, user) -> None:
@@ -437,6 +442,65 @@ def schedule_organize(request, file_id: str, user) -> None:
     except RuntimeError:
         # Sem event loop a correr (ex.: contexto de teste) — ignorar.
         log.debug('brain: no running event loop; skipping organisation of %s', file_id)
+
+
+##########################################
+# Reflexão "on-demand" (além do relógio)
+#
+# Depois de uma organização, o estado é actualizado logo a seguir em vez de
+# o utilizador esperar pelo ciclo de BRAIN_REFLECT_INTERVAL:
+#   • debounce (BRAIN_REFLECT_DEBOUNCE, s) agrupa uploads em lote num só ciclo;
+#   • min-gap (BRAIN_REFLECT_MIN_GAP, s) evita martelar o modelo a cada upload;
+#   • um lock garante que só uma reflexão corre de cada vez (relógio + trigger).
+##########################################
+
+BRAIN_REFLECT_DEBOUNCE = float(os.getenv('BRAIN_REFLECT_DEBOUNCE', '30'))
+BRAIN_REFLECT_MIN_GAP = float(os.getenv('BRAIN_REFLECT_MIN_GAP', '300'))
+
+_reflection_lock: asyncio.Lock | None = None
+_reflection_last_run = 0.0
+_reflection_scheduled = False
+
+
+def _get_reflection_lock() -> asyncio.Lock:
+    global _reflection_lock
+    if _reflection_lock is None:
+        _reflection_lock = asyncio.Lock()
+    return _reflection_lock
+
+
+def schedule_reflection(app, delay: float | None = None) -> None:
+    """Agenda uma reflexão após organização (debounced; nunca sobreposta)."""
+    global _reflection_scheduled
+    if _reflection_scheduled:
+        return  # já há um trigger pendente — o debounce agrupa o lote
+    if time.time() - _reflection_last_run < BRAIN_REFLECT_MIN_GAP:
+        log.debug('brain: reflection trigger skipped (min gap)')
+        return
+    _reflection_scheduled = True
+    try:
+        asyncio.create_task(
+            _reflection_after_delay(app, delay if delay is not None else BRAIN_REFLECT_DEBOUNCE)
+        )
+    except RuntimeError:
+        # Sem event loop (ex.: contexto de teste) — ignorar silenciosamente.
+        _reflection_scheduled = False
+        log.debug('brain: no running event loop; skipping reflection trigger')
+
+
+async def _reflection_after_delay(app, delay: float) -> None:
+    global _reflection_scheduled
+    try:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if time.time() - _reflection_last_run < BRAIN_REFLECT_MIN_GAP:
+            return
+        log.info('brain: on-demand reflection triggered by organisation')
+        await run_reflection(app)
+    except Exception:
+        log.exception('brain: on-demand reflection failed')
+    finally:
+        _reflection_scheduled = False
 
 
 ##########################################
@@ -538,6 +602,77 @@ _HONORIFICS = re.compile(
     r'^(profª|professor|professora|prof|dr\.?|dra?|eng\.?|sr|sra|exmo|exma)[.\s]+',
     re.I,
 )
+
+
+##############################################
+# Histórico do chat com o cérebro — no SERVIDOR
+#
+# Guardado por utilizador em DATA_DIR/brain_chat_<uid>.json: o browser deixa
+# de ser a única cópia (localStorage desaparecia ao trocar de máquina ou
+# limpar dados). Limite de BRAIN_CHAT_MAX_ITEMS trocas mais recentes.
+##############################################
+
+BRAIN_CHAT_MAX_ITEMS = 100
+
+
+def chat_history_path(user_id: str):
+    from open_webui.env import DATA_DIR
+
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', user_id or 'anonymous')[:64]
+    return DATA_DIR / f'brain_chat_{safe}.json'
+
+
+def load_chat_history(user_id: str) -> list[dict]:
+    """Trocas do chat deste utilizador (lista vazia se ainda não houver)."""
+    try:
+        with open(str(chat_history_path(user_id)), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        log.warning('brain: could not load chat history', exc_info=True)
+        return []
+
+
+def save_chat_history(user_id: str, items: list) -> int:
+    """Grava a lista validada (as mais recentes primeiro). Devolve o nº guardado."""
+    clean: list[dict] = []
+    for item in items[:BRAIN_CHAT_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get('q') or '').strip()
+        answer = item.get('a')
+        if not question or not isinstance(answer, str) or not answer.strip():
+            continue
+        sources = item.get('sources')
+        clean.append(
+            {
+                'q': question[:4000],
+                'a': answer[:30000],
+                'sources': [str(s)[:300] for s in sources][:32]
+                if isinstance(sources, list)
+                else [],
+            }
+        )
+    try:
+        path = chat_history_path(user_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = f'{path}.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(clean, handle, ensure_ascii=False)
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        log.warning('brain: could not save chat history', exc_info=True)
+    return len(clean)
+
+
+def clear_chat_history(user_id: str) -> None:
+    """Apaga o histórico deste utilizador (nunca levanta exceção)."""
+    try:
+        chat_history_path(user_id).unlink(missing_ok=True)
+    except Exception:
+        log.warning('brain: could not clear chat history', exc_info=True)
 
 
 def _canonical_entity_name(name: str, etype: str) -> str:
@@ -857,6 +992,19 @@ async def organize_backlog(request, limit: int = BACKLOG_ORGANIZE_PER_CYCLE) -> 
 
 
 async def run_reflection(app) -> dict:
+    """Ciclo de reflexão — serializado (só um corre de cada vez).
+
+    O relógio e o trigger on-demand partilham o mesmo lock; a hora do fim do
+    ciclo alimenta o min-gap do ``schedule_reflection``.
+    """
+    global _reflection_last_run
+    async with _get_reflection_lock():
+        state = await _run_reflection_impl(app)
+        _reflection_last_run = time.time()
+        return state
+
+
+async def _run_reflection_impl(app) -> dict:
     """Um ciclo de raciocínio: stats → (opcional) insights via LLM → estado."""
 
     # Passo 0: backlog — uploads antigos sem ficha (dá material à reflexão).
@@ -1131,6 +1279,64 @@ def pick_vision_model(models: dict) -> str | None:
     return next(iter(models), None)
 
 
+# Modelos de recurso com suporte de imagem (OpenRouter). O primeiro candidato
+# escolhido pode não aceitar imagens (HTTP404 "support image input") — daqui
+# se retira a lista de candidatos que o describe_image/describe_pdf tenta.
+# Env: BRAIN_VISION_FALLBACKS (separado por vírgulas).
+BRAIN_VISION_FALLBACKS = [
+    candidate.strip()
+    for candidate in os.getenv(
+        'BRAIN_VISION_FALLBACKS',
+        'google/gemini-2.0-flash-exp:free,meta-llama/llama-4-maverick-17b-128e-instruct:free',
+    ).split(',')
+    if candidate.strip()
+]
+
+
+def _catalog_vision_ids(models: dict) -> list[str]:
+    """IDs do catálogo do servidor com capacidade de visão declarada."""
+    ids = []
+    for model_id, info in models.items():
+        try:
+            capabilities = (((info or {}).get('info') or {}).get('meta') or {}).get('capabilities') or {}
+        except AttributeError:
+            capabilities = {}
+        if capabilities.get('vision'):
+            ids.append(model_id)
+    return ids
+
+
+def vision_candidates(user, models: dict) -> list[str]:
+    """Modelos a tentar, por ordem, para descrever imagens/PDFs.
+
+    Ordem: escolha explícita do cliente → modelos do catálogo com capacidade
+    de visão → fallbacks conhecidos → restantes modelos da ligação directa.
+    Sem duplicados; nunca levanta exceção.
+    """
+    seen: list[str] = []
+
+    def add(candidate) -> None:
+        if isinstance(candidate, str) and candidate.strip() and candidate.strip() not in seen:
+            seen.append(candidate.strip())
+
+    try:
+        add(resolve_model(user, 'vision', models if isinstance(models, dict) else {}))
+        for model_id in _catalog_vision_ids(models) if isinstance(models, dict) else []:
+            add(model_id)
+        for fallback in BRAIN_VISION_FALLBACKS:
+            add(fallback)
+        direct = _user_settings_dict(user).get('directConnections')
+        if isinstance(direct, dict):
+            configs = direct.get('OPENAI_API_CONFIGS') or {}
+            for index in sorted(configs.keys(), key=str):
+                for model_id in (configs.get(index) or {}).get('model_ids') or []:
+                    add(model_id)
+    except Exception:
+        log.warning('brain: could not build vision model candidates', exc_info=True)
+
+    return seen
+
+
 def resolve_model(user, function: str, models: dict) -> str | None:
     """Modelo escolhido pelo CLIENTE para uma função do cérebro.
 
@@ -1350,16 +1556,40 @@ def _image_data_uri(path: str, content_type: str | None = None) -> str | None:
             return None
 
 
+async def _describe_with_candidates(
+    request, form_base: dict, user, candidates: list[str], label: str
+) -> str | None:
+    """Tenta os modelos candidatos até um devolver descrição útil (>=20 chars).
+
+    Modelos de texto puro respondem com HTTP404 "support image input" no
+    OpenRouter — nesse caso passa-se ao seguinte candidato em vez de falhar.
+    """
+    for model in candidates:
+        form_data = {**form_base, 'model': model}
+        try:
+            text = await complete_with_provider(request, form_data, user, model)
+        except Exception:
+            log.warning('brain: %s description failed with model %s', label, model, exc_info=True)
+            continue
+        text = (text or '').strip()
+        if len(text) >= 20:
+            log.info('brain: %s described by %s (%d chars)', label, model, len(text))
+            return text
+    if candidates:
+        log.warning('brain: %s: no candidate model produced a description', label)
+    return None
+
+
 async def describe_image(request, file_path: str, content_type: str | None, user) -> str | None:
-    """Descrição em texto de uma imagem, via modelo de visão (None se falhar)."""
+    """Descri��ǜo em texto de uma imagem, via modelo de visǜo (None se falhar)."""
     if not BRAIN_ORGANIZE_ENABLED:
         return None
 
     from open_webui.storage.provider import Storage
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = resolve_model(user, 'vision', models)
-    if not model:
+    candidates = vision_candidates(user, models)
+    if not candidates:
         log.debug('brain: no model available to describe images')
         return None
 
@@ -1368,8 +1598,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
     if not data_uri:
         return None
 
-    form_data = {
-        'model': model,
+    form_base = {
         'messages': [
             {
                 'role': 'user',
@@ -1384,18 +1613,7 @@ async def describe_image(request, file_path: str, content_type: str | None, user
         'max_tokens': 600,
     }
 
-    try:
-        text = await complete_with_provider(request, form_data, user, model)
-    except Exception:
-        log.warning('brain: vision description failed for %s', file_path, exc_info=True)
-        return None
-
-    text = (text or '').strip()
-    if len(text) < 20:
-        return None
-
-    log.info('brain: image described by %s (%d chars)', model, len(text))
-    return text
+    return await _describe_with_candidates(request, form_base, user, candidates, 'image')
 
 
 ##########################################
@@ -1448,15 +1666,15 @@ def _pdf_page_data_uris(path: str, max_pages: int = BRAIN_PDF_MAX_PAGES) -> list
 
 
 async def describe_pdf(request, file_path: str, content_type: str | None, user) -> str | None:
-    """Descrição em texto das primeiras páginas de um PDF ilegível (None se falhar)."""
+    """Descri��ǜo em texto das primeiras pǭginas de um PDF ileg��vel (None se falhar)."""
     if not BRAIN_ORGANIZE_ENABLED:
         return None
 
     from open_webui.storage.provider import Storage
 
     models = getattr(request.app.state, 'MODELS', None) or {}
-    model = resolve_model(user, 'vision', models)
-    if not model:
+    candidates = vision_candidates(user, models)
+    if not candidates:
         log.debug('brain: no model available to describe PDFs')
         return None
 
@@ -1468,23 +1686,14 @@ async def describe_pdf(request, file_path: str, content_type: str | None, user) 
     content: list[dict] = [{'type': 'text', 'text': PDF_VISION_PROMPT}]
     content.extend({'type': 'image_url', 'image_url': {'url': uri}} for uri in uris)
 
-    form_data = {
-        'model': model,
+    form_base = {
         'messages': [{'role': 'user', 'content': content}],
         'stream': False,
         'temperature': 0.2,
         'max_tokens': 900,
     }
 
-    try:
-        text = await complete_with_provider(request, form_data, user, model)
-    except Exception:
-        log.warning('brain: PDF page description failed for %s', file_path, exc_info=True)
-        return None
-
-    text = (text or '').strip()
-    if len(text) < 20:
-        return None
-
-    log.info('brain: unreadable PDF described by %s (%d chars, %d page(s))', model, len(text), len(uris))
+    text = await _describe_with_candidates(request, form_base, user, candidates, 'PDF')
+    if text:
+        log.info('brain: unreadable PDF described (%d chars, %d page(s))', len(text), len(uris))
     return text

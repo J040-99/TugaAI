@@ -1,4 +1,4 @@
-"""Modo cérebro: construção do prompt e parsing robusto da resposta do LLM."""
+﻿"""Modo cérebro: construção do prompt e parsing robusto da resposta do LLM."""
 
 import os
 import sys
@@ -493,3 +493,142 @@ def test_stats_merge_people_titles_and_case_insensitive_tags():
     tags = {t['name']: t['count'] for t in out['top_tags']}
     assert tags.get('mysql') == 2
     assert 'MySQL' not in tags
+
+
+def test_chat_history_roundtrip(tmp_path, monkeypatch):
+    from open_webui.utils import brain
+
+    monkeypatch.setattr(brain, 'chat_history_path', lambda uid: tmp_path / 'chat.json')
+    assert brain.load_chat_history('user-1') == []
+
+    saved = brain.save_chat_history(
+        'user-1',
+        [
+            {'q': 'olá', 'a': 'bom dia', 'sources': ['doc.pdf']},
+            {'q': '', 'a': 'sem pergunta — ignorada'},
+            {'q': 'x', 'a': '   '},
+            'não-é-dict',
+        ],
+    )
+    assert saved == 1
+    assert brain.load_chat_history('user-1') == [
+        {'q': 'olá', 'a': 'bom dia', 'sources': ['doc.pdf']}
+    ]
+
+    brain.clear_chat_history('user-1')
+    assert brain.load_chat_history('user-1') == []
+
+
+def test_chat_history_caps_recent_items(tmp_path, monkeypatch):
+    from open_webui.utils import brain
+
+    monkeypatch.setattr(brain, 'chat_history_path', lambda uid: tmp_path / 'chat.json')
+    many = [{'q': f'q{i}', 'a': f'a{i}'} for i in range(brain.BRAIN_CHAT_MAX_ITEMS + 20)]
+    saved = brain.save_chat_history('u', many)
+    assert saved == brain.BRAIN_CHAT_MAX_ITEMS
+    items = brain.load_chat_history('u')
+    assert items[0]['q'] == 'q0'  # ordem preservada (mais recente primeiro)
+    assert items[-1]['q'] == f'q{brain.BRAIN_CHAT_MAX_ITEMS - 1}'
+
+
+def test_schedule_reflection_without_loop_is_silent():
+    import open_webui.utils.brain as brain
+
+    brain._reflection_scheduled = False
+    brain._reflection_last_run = 0.0
+    # sem event loop não há como criar tasks — nunca pode rebentar
+    brain.schedule_reflection(app=None)
+    assert brain._reflection_scheduled is False
+
+
+def test_schedule_reflection_respects_min_gap(monkeypatch):
+    import time
+
+    import open_webui.utils.brain as brain
+
+    monkeypatch.setattr(brain, 'BRAIN_REFLECT_MIN_GAP', 9999.0)
+    monkeypatch.setattr(brain, '_reflection_last_run', time.time())
+    monkeypatch.setattr(brain, '_reflection_scheduled', False)
+    brain.schedule_reflection(app=None)
+    # dentro do min-gap → não agenda nada
+    assert brain._reflection_scheduled is False
+
+
+def test_vision_candidates_order_and_dedupe():
+    from types import SimpleNamespace
+
+    import open_webui.utils.brain as brain
+
+    user = SimpleNamespace(
+        settings={
+            'brain': {'vision_model': 'cliente/vision-escolhido'},
+            'ui': {
+                'directConnections': {
+                    'OPENAI_API_CONFIGS': {
+                        '0': {'model_ids': ['texto/so-texto', 'cliente/vision-escolhido']},
+                        '1': {'model_ids': ['outro/modelo']},
+                    }
+                }
+            },
+        }
+    )
+    models = {
+        'catalogo/com-visao': {'info': {'meta': {'capabilities': {'vision': True}}}},
+        'catalogo/texto': {},
+    }
+
+    out = brain.vision_candidates(user, models)
+
+    # escolha explícita do cliente primeiro
+    assert out[0] == 'cliente/vision-escolhido'
+    # modelos do catálogo só entram se tiverem capacidade de visão
+    assert 'catalogo/com-visao' in out
+    assert 'catalogo/texto' not in out
+    # fallbacks conhecidos presentes (suporte de imagem)
+    assert brain.BRAIN_VISION_FALLBACKS[0] in out
+    # modelos da ligação directa no fim, sem duplicados
+    assert out.index('outro/modelo') > out.index('catalogo/com-visao')
+    assert len(out) == len(set(out))
+
+
+def test_ocr_pdf_text_on_scanned_page(tmp_path):
+    import pytest
+
+    pytest.importorskip('pymupdf')
+    try:
+        from rapidocr import RapidOCR
+
+        RapidOCR()
+    except Exception as e:  # pragma: no cover - depende do ambiente
+        pytest.skip(f'RapidOCR indisponível neste ambiente: {e}')
+
+    import pymupdf
+    from open_webui.retrieval.loaders.pdf import PDFLoader, ocr_pdf_text
+
+    #1) gera uma página com texto e rasteriza-a (fonte da imagem)
+    seed = pymupdf.open()
+    seed_page = seed.new_page()
+    seed_page.insert_text((72, 72), 'OLA TUGAAI PDF DIGITALIZADO')
+    pixmap = seed_page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+
+    #2) monta o "scan": página em branco com só a imagem colada (sem texto)
+    doc = pymupdf.open()
+    page = doc.new_page(width=seed_page.rect.width, height=seed_page.rect.height)
+    page.insert_image(page.rect, stream=pixmap.tobytes('png'))
+    path = tmp_path / 'scan.pdf'
+    doc.save(str(path))
+    seed.close()
+    doc.close()
+
+    # sem camada de texto...
+    from pypdf import PdfReader
+
+    assert (PdfReader(str(path)).pages[0].extract_text() or '').strip() == ''
+
+    # ...mas o OCR local devolve o texto
+    text = ocr_pdf_text(str(path))
+    assert 'TUGAAI' in text.upper(), f'OCR devolveu: {text!r}'
+
+    # e o loader do Knowledge indexa a página (não vazio)
+    docs = [d for d in PDFLoader(str(path), extract_images=True).lazy_load()]
+    assert docs and 'TUGAAI' in docs[0].page_content.upper()
