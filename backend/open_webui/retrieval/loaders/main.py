@@ -29,6 +29,7 @@ from open_webui.retrieval.loaders.local import (
 from open_webui.retrieval.loaders.mineru import MinerULoader
 from open_webui.retrieval.loaders.mistral import MistralLoader
 from open_webui.retrieval.loaders.paddleocr_vl import PADDLEOCR_VL_SUPPORTED_EXTENSIONS, PaddleOCRVLLoader
+from open_webui.retrieval.loaders.excalidraw import ExcalidrawLoader
 from open_webui.retrieval.loaders.pdf import PDFLoader
 from open_webui.utils.headers import get_user_groups_for_custom_headers
 from open_webui.utils.json_codec import JSONCodec
@@ -746,6 +747,10 @@ class Loader:
                 loader = HTMLLoader(file_path, encoding='unicode_escape')
             elif file_ext == 'md':
                 loader = TextLoader(file_path, encoding=self._detect_text_encoding(file_path))
+            elif file_ext == 'excalidraw':
+                # Diagramas do Excalidraw (JSON): extrai os textos e as formas
+                # para indexar — em vez do JSON bruto, que não é pesquisável.
+                loader = ExcalidrawLoader(file_path)
             elif file_content_type == 'application/epub+zip':
                 try:
                     loader = UnstructuredLoader(file_path, 'epub')

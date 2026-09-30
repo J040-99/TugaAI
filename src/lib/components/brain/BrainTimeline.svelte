@@ -2,6 +2,7 @@
 	import { getContext } from 'svelte';
 	import dayjs from '$lib/dayjs';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import ExcalidrawPreview from './ExcalidrawPreview.svelte';
 	import { CATEGORY_STYLES, ENTITY_STYLES } from './constants';
 
 	const i18n = getContext('i18n');
@@ -84,6 +85,11 @@
 									</button>
 								{/each}
 							</div>
+						{/if}
+
+						<!-- Diagramas do Excalidraw: pré-visualização do desenho -->
+						{#if (card.filename ?? '').toLowerCase().endsWith('.excalidraw')}
+							<ExcalidrawPreview fileId={card.id} />
 						{/if}
 
 						<div

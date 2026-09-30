@@ -13,6 +13,8 @@
 	const i18n = getContext('i18n');
 
 	let loading = true;
+	// Menu lateral direito (Gestor de informação) — aberto por omissão no desktop.
+	let managerOpen = true;
 	let cards: any[] = [];
 	let reflection: any = null;
 	let query = '';
@@ -189,16 +191,31 @@
 	<title>{$i18n.t('Brain')}</title>
 </svelte:head>
 
-<div class="flex h-full w-full flex-col overflow-x-hidden">
-	<div class="flex-1 overflow-y-auto">
+<div class="flex h-full w-full overflow-hidden">
+	<!-- Conteúdo principal -->
+	<div class="min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
 		<div class="mx-auto w-full max-w-4xl px-4 pt-6 pb-24 sm:px-6">
 			<header class="mb-6">
-				<h1 class="text-xl font-semibold text-gray-900 dark:text-white">
-					{$i18n.t('Brain')}
-				</h1>
-				<p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-					{$i18n.t('Your knowledge, organised')}
-				</p>
+				<div class="flex items-start justify-between gap-3">
+					<div>
+						<h1 class="text-xl font-semibold text-gray-900 dark:text-white">
+							{$i18n.t('Brain')}
+						</h1>
+						<p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+							{$i18n.t('Your knowledge, organised')}
+						</p>
+					</div>
+					<!-- Abre/fecha o menu lateral do gestor -->
+					<button
+						class="shrink-0 rounded-xl border px-3 py-1.5 text-xs font-medium transition {managerOpen
+							? 'border-gray-900 bg-gray-900 text-white dark:border-white dark:bg-white dark:text-gray-900'
+							: 'border-gray-200 text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800'}"
+						aria-expanded={managerOpen}
+						on:click={() => (managerOpen = !managerOpen)}
+					>
+						{$i18n.t('Information manager')}
+					</button>
+				</div>
 
 				<div class="mt-4 flex flex-wrap gap-4 text-sm text-gray-600 dark:text-gray-300">
 					<span><strong>{stats.documents}</strong> {$i18n.t('documents')}</span>
@@ -213,9 +230,6 @@
 
 			<!-- Chat com o cérebro (histórico guardado no servidor) -->
 			<BrainChat />
-
-			<!-- Gestor de informação: adicionar, editar, reorganizar, apagar -->
-			<BrainManager {cards} {dupCounts} onChanged={() => loadPage(1, false)} />
 
 			<!-- Modelos por função — escolha deste cliente -->
 			<BrainModels />
@@ -315,4 +329,22 @@
 			/>
 		</div>
 	</div>
+
+	<!-- Fundo (telemóvel/tablet) -->
+	{#if managerOpen}
+		<button
+			class="fixed inset-0 z-30 bg-black/30 xl:hidden"
+			aria-label={$i18n.t('Cancel')}
+			on:click={() => (managerOpen = false)}
+		></button>
+	{/if}
+
+	<!-- Menu lateral direito: Gestor de informação -->
+	<aside
+		class="fixed inset-y-0 right-0 z-40 w-80 max-w-[85vw] overflow-y-auto border-l border-gray-200 bg-white p-4 shadow-2xl transition-transform duration-200 dark:border-gray-800 dark:bg-gray-900 xl:static xl:z-0 xl:w-80 xl:shrink-0 xl:shadow-none {managerOpen
+			? 'translate-x-0'
+			: 'translate-x-full xl:hidden'}"
+	>
+		<BrainManager {cards} {dupCounts} onChanged={() => loadPage(1, false)} />
+	</aside>
 </div>
