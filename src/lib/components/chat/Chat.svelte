@@ -3067,37 +3067,46 @@
 			// O turno pendente é registado UMA vez em sendMessage e consumido
 			// aqui, casado pelo id da resposta (idempotente: flag por mensagem).
 			// Resposta com erro ou vazia só limpa o pendente — não aprende.
-			if (pendingBrainTurn && pendingBrainTurn.assistantMessageId === message.id) {
-				const { question, sources: fallbackSources } = pendingBrainTurn;
-				pendingBrainTurn = null;
+			if (
+				pendingBrainTurn &&
+				(pendingBrainTurn.assistantMessageId === message.id ||
+					(pendingBrainTurn.userMessageId && message.parentId === pendingBrainTurn.userMessageId))
+			) {
+				const respostaVazia = String(message.content ?? '').trim() === '';
+				// Resposta vazia sem erro (stream morreu a meio): NÃO consome o
+				// turno — um regenerar/reenvio com o mesmo pai pode ainda aprender.
+				if (!respostaVazia || message.error) {
+					const { question, sources: fallbackSources } = pendingBrainTurn;
+					pendingBrainTurn = null;
 
-				const canLearn =
-					$brainMode &&
-					!message.error &&
-					!message.brainLearned &&
-					String(message.content ?? '').trim() !== '';
+					const canLearn =
+						$brainMode &&
+						!message.error &&
+						!message.brainLearned &&
+						String(message.content ?? '').trim() !== '';
 
-				if (canLearn) {
-					message.brainLearned = true;
-					history.messages[message.id] = message;
+					if (canLearn) {
+						message.brainLearned = true;
+						history.messages[message.id] = message;
 
-					const sources = extractBrainSourceNames(message.sources);
-					learnFromConversation(
-						question,
-						message.content ?? '',
-						sources.length > 0 ? sources : fallbackSources
-					).then((saved) => {
-						if (!saved) return;
-						const target = history.messages[message.id];
-						if (!target || target.brainSaved) return;
-						target.brainSaved = true;
-						target.statusHistory = [
-							...(target.statusHistory ?? []),
-							{ action: 'brain_saved', description: $i18n.t('Saved to the brain') }
-						];
-						history.messages[message.id] = target;
-						history = history;
-					});
+						const sources = extractBrainSourceNames(message.sources);
+						learnFromConversation(
+							question,
+							message.content ?? '',
+							sources.length > 0 ? sources : fallbackSources
+						).then((saved) => {
+							if (!saved) return;
+							const target = history.messages[message.id];
+							if (!target || target.brainSaved) return;
+							target.brainSaved = true;
+							target.statusHistory = [
+								...(target.statusHistory ?? []),
+								{ action: 'brain_saved', description: $i18n.t('Saved to the brain') }
+							];
+							history.messages[message.id] = target;
+							history = history;
+						});
+					}
 				}
 			}
 
@@ -3119,6 +3128,7 @@
 	let pendingBrainTurn: {
 		question: string;
 		assistantMessageId: string;
+		userMessageId: string;
 		sources: string[];
 	} | null = null;
 
@@ -3710,10 +3720,12 @@ ${BRAIN_INSTRUCTIONS}`;
 			}
 
 			// Turno pendente de write-back: registado UMA vez, aqui, para todo
-			// o envio novo; consumido no done handler da MESMA resposta.
+			// o envio novo; consumido no done handler da MESMA resposta (ou de
+			// um regenerar com o mesmo pai — resposta vazia não consome o turno).
 			pendingBrainTurn = {
 				question: brainQuestion,
 				assistantMessageId: brainTargetId,
+				userMessageId: history.messages[brainTargetId]?.parentId ?? '',
 				sources: contextSources
 			};
 		}
