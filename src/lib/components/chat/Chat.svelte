@@ -1965,7 +1965,14 @@
 
 				if (htmlGroups && htmlGroups.length > 0) {
 					htmlGroups.forEach((group) => {
-						const renderedContent = `
+						// Documento completo (já com <!DOCTYPE>/<html>): usar tal e qual.
+						// Envolver criava DOCTYPEs aninhados e o download saía com DOIS
+						// documentos HTML dentro do mesmo ficheiro.
+						const isFullDoc = /^\s*(<!doctype\s+html|<html[\s>])/i.test(group.html);
+						const renderedContent =
+							isFullDoc && !String(group.css ?? '').trim() && !String(group.js ?? '').trim()
+								? group.html
+								: `
                         <!DOCTYPE html>
                         <html lang="en">
                         <head>
@@ -3163,7 +3170,7 @@
 	};
 
 	const BRAIN_INSTRUCTIONS =
-		'Responde em português de Portugal: directo, útil e com raciocínio. Usa o conhecimento pessoal acima como BASE PRINCIPAL (cita os documentos pelas fontes). Se as integrações de pesquisa web ou código estiverem activas, complementa com elas. Quando pedirem código ou um ficheiro (HTML, CSS, JS, Python, etc.), começa por uma frase de contexto e entrega o código SEMPRE dentro de um bloco cercado com ``` (e a linguagem certa logo a seguir às crases) — nunca solto no texto, para aparecer como bloco de código com botão de cópia.';
+		'Responde em português de Portugal: directo, útil e com raciocínio. Usa o conhecimento pessoal acima como BASE PRINCIPAL (cita os documentos pelas fontes). Se as integrações de pesquisa web ou código estiverem activas, complementa com elas. Quando pedirem código ou um ficheiro (HTML, CSS, JS, Python, etc.), começa por uma frase de contexto e entrega o código SEMPRE dentro de um bloco cercado com ``` (e a linguagem certa logo a seguir às crases) — nunca solto no texto, para aparecer como bloco de código com botão de cópia. Se pedirem para CRIAR uma ferramenta, página ou app, gera um artefacto INTERACTIVO e funcional (inputs, cálculos e/ou gráficos a funcionar no browser), UM único documento HTML válido (um só <!DOCTYPE> e um só <html>), que JUNTA os pontos fortes pedidos — nunca uma lista estática a descrever cada item.';
 
 	// Bloco EXACTO que viaja no payload do completion (nunca no chat guardado).
 	const buildBrainCompletionUserContent = (question: string, contextBlock: string): string =>
