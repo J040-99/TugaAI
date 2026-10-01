@@ -3063,39 +3063,42 @@
 			);
 
 			// Modo cérebro: write-back — guarda o que esta conversa ensinou
-			// como nota indexável no cérebro. Fire-and-forget, sem toasts;
-			// só em turnos iniciados por submitPrompt (nem regenerate/continue)
-			// e só UMA vez por resposta (flag por mensagem + brainLearnTurn).
-			if (
-				brainLearnTurn &&
-				$brainMode &&
-				!message.error &&
-				!message.brainLearned &&
-				String(message.content ?? '').trim() !== ''
-			) {
-				const question = brainLearnTurn.question;
-				const fallbackSources = brainLearnTurn.sources ?? [];
-				brainLearnTurn = null;
-				message.brainLearned = true;
-				history.messages[message.id] = message;
+			// como nota indexável no cérebro. Fire-and-forget, sem toasts.
+			// O turno pendente é registado UMA vez em sendMessage e consumido
+			// aqui, casado pelo id da resposta (idempotente: flag por mensagem).
+			// Resposta com erro ou vazia só limpa o pendente — não aprende.
+			if (pendingBrainTurn && pendingBrainTurn.assistantMessageId === message.id) {
+				const { question, sources: fallbackSources } = pendingBrainTurn;
+				pendingBrainTurn = null;
 
-				const sources = extractBrainSourceNames(message.sources);
-				learnFromConversation(
-					question,
-					message.content ?? '',
-					sources.length > 0 ? sources : fallbackSources
-				).then((saved) => {
-					if (!saved) return;
-					const target = history.messages[message.id];
-					if (!target || target.brainSaved) return;
-					target.brainSaved = true;
-					target.statusHistory = [
-						...(target.statusHistory ?? []),
-						{ action: 'brain_saved', description: $i18n.t('Saved to the brain') }
-					];
-					history.messages[message.id] = target;
-					history = history;
-				});
+				const canLearn =
+					$brainMode &&
+					!message.error &&
+					!message.brainLearned &&
+					String(message.content ?? '').trim() !== '';
+
+				if (canLearn) {
+					message.brainLearned = true;
+					history.messages[message.id] = message;
+
+					const sources = extractBrainSourceNames(message.sources);
+					learnFromConversation(
+						question,
+						message.content ?? '',
+						sources.length > 0 ? sources : fallbackSources
+					).then((saved) => {
+						if (!saved) return;
+						const target = history.messages[message.id];
+						if (!target || target.brainSaved) return;
+						target.brainSaved = true;
+						target.statusHistory = [
+							...(target.statusHistory ?? []),
+							{ action: 'brain_saved', description: $i18n.t('Saved to the brain') }
+						];
+						history.messages[message.id] = target;
+						history = history;
+					});
+				}
 			}
 
 			// Process next queued request if any
@@ -3110,8 +3113,14 @@
 	//////////////////////////
 
 	// Turno em modo cérebro que espera pelo write-back (aprendizagem).
-	// Só é definido em submitPrompt — regenerate/continue nunca o definem.
-	let brainLearnTurn: { question: string; sources: string[] } | null = null;
+	// Registado UMA vez, dentro de sendMessage, apenas para turnos novos do
+	// utilizador — regenerate/continue nunca o criam. Anulado quando o turno
+	// termina (aprenda ou não), em erro real ou por substituição (novo turno).
+	let pendingBrainTurn: {
+		question: string;
+		assistantMessageId: string;
+		sources: string[];
+	} | null = null;
 
 	const BRAIN_CONTEXT_TIMEOUT_MS = 8000;
 
@@ -3249,25 +3258,18 @@ ${BRAIN_INSTRUCTIONS}`;
 
 		saveSessionSelectedModels();
 
-		brainLearnTurn = null;
-
-		if ($brainMode) {
-			if (selectedModels.includes('')) {
-				// Sem modelo escolhido o completion normal não corre — o modo
-				// cérebro já NÃO substitui o modelo (era o fluxo antigo).
-				toast.error($i18n.t('Model not selected'));
-				return;
-			}
-
-			// Modo cérebro: o completion NORMAL continua a correr (modelo,
-			// pesquisa web, código…). O contexto do cérebro é buscado dentro
-			// de sendMessage (com estado na mensagem do assistente) e viaja
-			// SÓ no payload do completion — a pergunta guardada fica pura.
-			brainLearnTurn = { question: inputContent, sources: [] };
-			await sendMessage(history, userMessageId, { brainQuestion: inputContent });
+		if ($brainMode && selectedModels.includes('')) {
+			// Sem modelo escolhido o completion normal não corre — o modo
+			// cérebro já NÃO substitui o modelo (era o fluxo antigo).
+			toast.error($i18n.t('Model not selected'));
 			return;
 		}
 
+		// Modo cérebro: o completion NORMAL continua a correr (modelo,
+		// pesquisa web, código…). O contexto do cérebro e o registo do turno
+		// pendente de write-back acontecem DENTRO de sendMessage — o ponto de
+		// choke comum a todos os caminhos que criam um turno novo — e viajam
+		// SÓ no payload do completion, a pergunta guardada fica pura.
 		await sendMessage(history, userMessageId);
 	};
 
@@ -3548,14 +3550,12 @@ ${BRAIN_INSTRUCTIONS}`;
 			messages = null,
 			modelId = null,
 			modelIdx = null,
-			regenerationPrompt = null,
-			brainQuestion = null
+			regenerationPrompt = null
 		}: {
 			messages?: any[] | null;
 			modelId?: string | null;
 			modelIdx?: number | null;
 			regenerationPrompt?: string | null;
-			brainQuestion?: string | null;
 		} = {}
 	) => {
 		if (autoScroll) {
@@ -3564,6 +3564,20 @@ ${BRAIN_INSTRUCTIONS}`;
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
 		_history = structuredClone(_history);
+
+		// Turno NOVO do utilizador vs. regeneração/continuação. Um turno novo
+		// nasce de uma mensagem de utilizador ainda SEM respostas filhas — é o
+		// caso de submitPrompt, follow-ups (submitMessage) e edição & reenvio
+		// (Messages.editMessage), todos eles chamadores de sendMessage.
+		// regenerate reutiliza a mesma mensagem de utilizador que JÁ tem
+		// resposta; continue nem entra por aqui. Critério estrutural, logo não
+		// depende de um parâmetro que só um caminho de envio passa.
+		const parentUserMessage = parentId ? history.messages[parentId] : null;
+		const isNewUserTurn =
+			!regenerationPrompt &&
+			!(messages && messages.length > 0) &&
+			parentUserMessage?.role === 'user' &&
+			(parentUserMessage?.childrenIds?.length ?? 0) === 0;
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
@@ -3648,15 +3662,24 @@ ${BRAIN_INSTRUCTIONS}`;
 			await tick();
 		}
 
-		// Modo cérebro: busca a memória do cérebro ANTES do completion, com
-		// estado visível na mensagem do assistente. O bloco devolvido viaja
-		// SÓ no payload — a mensagem guardada do utilizador fica com a pergunta pura.
+		// Modo cérebro: PONTO ÚNICO de entrada do fluxo de leitura. Corre para
+		// QUALQUER caminho que crie um turno novo do utilizador (input,
+		// follow-ups, edição & reenvio), nunca em regenerate/continue, com
+		// timeout 8s e fail-open: se a memória não responde, o completion
+		// segue sem contexto. Estado visível na mensagem do assistente enquanto
+		// espera; o bloco devolvido viaja SÓ no payload — a mensagem guardada
+		// do utilizador fica com a pergunta pura.
 		let brainPayloadContext: { block: string; sources: string[] } | null = null;
-		if (brainQuestion) {
-			const targetId = messageIdsList[0]?.message_id;
-			const target = targetId ? history.messages[targetId] : null;
+		const brainTargetId = messageIdsList[0]?.message_id;
+		const brainQuestion = isNewUserTurn
+			? String(history.messages[parentId]?.content ?? '').trim()
+			: '';
+
+		if ($brainMode && brainQuestion && brainTargetId) {
+			const target = history.messages[brainTargetId];
 			if (target) {
 				target.statusHistory = [
+					...(target.statusHistory ?? []),
 					{ action: 'brain_think', description: $i18n.t("Consulting the brain's memory…") }
 				];
 				history.messages[target.id] = target;
@@ -3665,21 +3688,34 @@ ${BRAIN_INSTRUCTIONS}`;
 			}
 
 			const brainData = await fetchBrainContext(brainQuestion);
-			if (target && history.messages[target.id]) {
-				history.messages[target.id].statusHistory = [];
+
+			// Só remove o chip brain_think — estados entretanto recebidos
+			// (pesquisa web, ferramentas…) ficam intactos.
+			const pendingTarget =
+				target && history.messages[target.id] ? history.messages[target.id] : null;
+			if (pendingTarget?.statusHistory) {
+				pendingTarget.statusHistory = pendingTarget.statusHistory.filter(
+					(status) => status.action !== 'brain_think'
+				);
+				history.messages[pendingTarget.id] = pendingTarget;
 			}
 			history = history;
 
 			const block = typeof brainData?.context === 'string' ? brainData.context.trim() : '';
+			const contextSources = Array.isArray(brainData?.sources)
+				? brainData.sources.filter((s: unknown) => typeof s === 'string' && s)
+				: [];
 			if (block) {
-				const contextSources = Array.isArray(brainData?.sources)
-					? brainData.sources.filter((s: unknown) => typeof s === 'string' && s)
-					: [];
 				brainPayloadContext = { block, sources: contextSources };
-				if (brainLearnTurn && brainLearnTurn.question === brainQuestion) {
-					brainLearnTurn.sources = contextSources;
-				}
 			}
+
+			// Turno pendente de write-back: registado UMA vez, aqui, para todo
+			// o envio novo; consumido no done handler da MESMA resposta.
+			pendingBrainTurn = {
+				question: brainQuestion,
+				assistantMessageId: brainTargetId,
+				sources: contextSources
+			};
 		}
 
 		await tick();
@@ -4080,7 +4116,10 @@ ${BRAIN_INSTRUCTIONS}`;
 			};
 
 			// Turno falhado → não fica pendente um write-back antigo.
-			brainLearnTurn = null;
+			// Só anula o pendente DESTA resposta (nunca o de outro turno).
+			if (pendingBrainTurn?.assistantMessageId === responseMessageId) {
+				pendingBrainTurn = null;
+			}
 
 			responseMessage.done = true;
 
@@ -4195,6 +4234,11 @@ ${BRAIN_INSTRUCTIONS}`;
 			raw: error
 		};
 		responseMessage.done = true;
+
+		// Erro real nesta resposta → larga o turno pendente de write-back.
+		if (pendingBrainTurn?.assistantMessageId === responseMessage.id) {
+			pendingBrainTurn = null;
+		}
 
 		if (responseMessage.statusHistory) {
 			responseMessage.statusHistory = responseMessage.statusHistory.filter(
