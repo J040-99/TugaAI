@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 
 log = logging.getLogger(__name__)
 
@@ -1099,6 +1100,9 @@ Regras:
 ### Fichas relevantes
 {cards}
 
+### Aprendizagens recentes de conversas
+{learnings}
+
 ### Trechos do conteúdo real dos documentos (fonte para exemplos concretos)
 {excerpts}
 
@@ -1108,9 +1112,19 @@ Regras:
 
 
 def build_ask_prompt(
-    question: str, state: dict, cards: list[dict], user=None, excerpts: list | None = None
+    question: str,
+    state: dict,
+    cards: list[dict],
+    user=None,
+    excerpts: list | None = None,
+    learnings: list | None = None,
 ) -> str:
-    """Prompt da conversa com o cérebro (função pura, testável)."""
+    """Prompt da conversa com o cérebro (função pura, testável).
+
+    ``learnings``: aprendizagens extraídas de conversas anteriores (mais
+    recentes primeiro) — ``answer_question`` passa-as com
+    ``recent_learnings()`` para o cérebro se lembrar do que aprendeu.
+    """
     stats = (state or {}).get('stats') or {}
     stats_line = (
         f"documentos={stats.get('documents', 0)}, pessoas={stats.get('people', 0)}, "
@@ -1136,11 +1150,19 @@ def build_ask_prompt(
     ]
     excerpts_block = '\n\n'.join(excerpt_parts) or '(sem trechos disponíveis)'
 
+    learning_lines = [
+        f'- {_clean_str(str(item), 300)}'
+        for item in (learnings or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    learnings_block = '\n'.join(learning_lines[:10]) or '(sem aprendizagens registadas)'
+
     owner = getattr(user, 'name', None) or 'o utilizador'
     return (
         ASK_PROMPT_TEMPLATE.replace('{memory_index}', memory_index)
         .replace('{stats}', stats_line)
         .replace('{cards}', cards_block)
+        .replace('{learnings}', learnings_block)
         .replace('{excerpts}', excerpts_block)
         .replace('{question}', question.strip())
         .replace('{owner}', owner)
@@ -1166,6 +1188,21 @@ async def _load_excerpts(matched: list, limit: int = 4) -> list:
     return excerpts
 
 
+async def find_cards_for_question(question: str, limit: int = 15) -> list[dict]:
+    """Fichas que casam com *question* (mesmo filtro usado em ``/brain/ask``).
+
+    Varre os ficheiros por páginas e pára no primeiro ``limit`` acertos —
+    nunca carrega tudo para memória.
+    """
+    matched: list[dict] = []
+    async for card in iter_brain_cards():
+        if card_matches(card, q=question):
+            matched.append(card)
+            if len(matched) >= limit:
+                break
+    return matched
+
+
 async def answer_question(request, question: str, user) -> dict | None:
     """Resposta do cérebro a uma pergunta: contexto + provedor do cliente."""
     question = (question or '').strip()
@@ -1175,12 +1212,7 @@ async def answer_question(request, question: str, user) -> dict | None:
     state = load_reflection()
 
     # Fichas que casam com a pergunta (varrimento leve, com limite).
-    matched: list[dict] = []
-    async for card in iter_brain_cards():
-        if card_matches(card, q=question):
-            matched.append(card)
-            if len(matched) >= 15:
-                break
+    matched = await find_cards_for_question(question, limit=15)
 
     # Conteúdo real dos documentos mais relevantes — é ele que permite
     # exemplos prâcticos (SQL, passos, …) em vez de só resumos.
@@ -1192,7 +1224,9 @@ async def answer_question(request, question: str, user) -> dict | None:
         log.debug('brain: no model available to answer questions')
         return None
 
-    prompt = build_ask_prompt(question, state, matched, user, excerpts=excerpts)
+    prompt = build_ask_prompt(
+        question, state, matched, user, excerpts=excerpts, learnings=recent_learnings()
+    )
     form_data = {
         'model': model,
         'messages': [{'role': 'user', 'content': prompt}],
@@ -1217,6 +1251,456 @@ async def answer_question(request, question: str, user) -> dict | None:
         'sources': [card.get('filename') for card in matched if card.get('filename')],
         'model': model,
     }
+
+
+##############################################
+# Aprendizagens (write-back) — o cérebro guarda
+# o que aprendeu com cada conversa em modo cérebro.
+#
+# Ficheiro único do servidor DATA_DIR/brain_learnings.json (mesmo padrão da
+# reflexão: escrita atómica tmp+os.replace, nunca exceção), lista mais
+# recente primeiro com {"ts","question","learning","chat_id","user_id"}.
+# Dedupe pela pergunta normalizada — repetir a mesma pergunta ACTUALIZA a
+# aprendizagem em vez de duplicar. Limite: BRAIN_LEARN_MAX entradas.
+##############################################
+
+BRAIN_LEARNINGS_FILENAME = 'brain_learnings.json'
+BRAIN_LEARN_MAX = 40
+BRAIN_LEARN_MAX_QUESTION = 4000
+BRAIN_LEARN_MAX_LEARNING = 600
+BRAIN_LEARN_RECENT = 10
+
+DISTILL_PROMPT_TEMPLATE = """És a memória de longo prazo de um utilizador (o "cérebro" pessoal dele).
+Lê a conversa abaixo e extrai APENAS uma aprendizagem nova e útil.
+
+Regras:
+- A aprendizagem tem1 a3 frases, em português de Portugal, CONCRETA
+  (facto sobre o utilizador, preferência, decisão tomada, passo/procedimento aprendido).
+- Escreve APENAS sobre o que a conversa ensina — não repitas a pergunta.
+- Se não houver nada de novo e útil (pergunta trivial, saudação, resposta
+  genérica ou knowledge óbvio), responde exactamente:
+{"learning": ""}
+- Vai DIRECTO ao objecto JSON final: sem markdown, sem comentários, sem
+  processo de pensamento.
+
+### Pergunta do utilizador
+{question}
+
+### Resposta do assistente
+{answer}
+"""
+
+_learnings_file = None
+
+
+def _learnings_path():
+    global _learnings_file
+    if _learnings_file is None:
+        from open_webui.env import DATA_DIR
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _learnings_file = DATA_DIR / BRAIN_LEARNINGS_FILENAME
+    return _learnings_file
+
+
+def load_learnings() -> list[dict]:
+    """Aprendizagens persistidas (mais recente primeiro; nunca exceção)."""
+    try:
+        with open(str(_learnings_path()), encoding='utf-8') as handle:
+            data = json.load(handle)
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        log.warning('brain: could not load learnings', exc_info=True)
+        return []
+
+
+def save_learnings(items: list) -> int:
+    """Grava a lista validada, mais recente primeiro; nunca levanta exceção."""
+    clean: list[dict] = []
+    for item in items[:BRAIN_LEARN_MAX]:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get('question') or '').strip()
+        learning = str(item.get('learning') or '').strip()
+        if not question or not learning:
+            continue
+        chat_id = str(item.get('chat_id') or '').strip()
+        user_id = str(item.get('user_id') or '').strip()
+        try:
+            ts = int(item.get('ts') or time.time())
+        except (TypeError, ValueError):
+            ts = int(time.time())
+        clean.append(
+            {
+                'ts': ts,
+                'question': question[:BRAIN_LEARN_MAX_QUESTION],
+                'learning': learning[:BRAIN_LEARN_MAX_LEARNING],
+                'chat_id': chat_id[:64],
+                'user_id': user_id[:64],
+            }
+        )
+    try:
+        path = str(_learnings_path())
+        tmp_path = f'{path}.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(clean, handle, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        log.warning('brain: could not persist learnings', exc_info=True)
+        return 0
+    return len(clean)
+
+
+def normalise_learning_question(question) -> str:
+    """Chave de dedupe: minúsculas, sem acentos, sem pontuação."""
+    text = unicodedata.normalize('NFKD', str(question or ''))
+    text = text.encode('ascii', 'ignore').decode('ascii').lower()
+    return re.sub(r'[^a-z0-9]+', ' ', text).strip()
+
+
+def recent_learnings(limit: int = BRAIN_LEARN_RECENT) -> list[str]:
+    """As últimas *limit* aprendizagens (texto, mais recente primeiro)."""
+    out: list[str] = []
+    for item in load_learnings():
+        learning = str(item.get('learning') or '').strip()
+        if learning:
+            out.append(learning)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def store_learning(
+    question: str, learning: str, chat_id: str | None = None, user_id: str | None = None
+) -> bool:
+    """Guarda uma aprendizagem (dedupe por pergunta normalizada + cap)."""
+    question = str(question or '').strip()
+    learning = str(learning or '').strip()
+    key = normalise_learning_question(question)
+    if not question or not learning or not key:
+        return False
+
+    items = load_learnings()
+    entry = {
+        'ts': int(time.time()),
+        'question': question[:BRAIN_LEARN_MAX_QUESTION],
+        'learning': learning[:BRAIN_LEARN_MAX_LEARNING],
+        'chat_id': str(chat_id or '')[:64],
+        'user_id': str(user_id or '')[:64],
+    }
+
+    existing_index = next(
+        (
+            index
+            for index, item in enumerate(items)
+            if normalise_learning_question(item.get('question')) == key
+        ),
+        None,
+    )
+    if existing_index is not None:
+        # Mesma pergunta → actualiza (fica de novo no topo, sem duplicado).
+        merged = {**items[existing_index], **entry}
+        items.pop(existing_index)
+        items.insert(0, merged)
+    else:
+        items.insert(0, entry)
+
+    return save_learnings(items) > 0
+
+
+def parse_learning(raw) -> str:
+    """Aprendizagem do LLM (string vazia = nada de novo/útil).
+
+    Só aceita JSON (directo ou cercado); o resto é deitado fora — melhor
+    não guardar nada do que guardar lixo na memória.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ''
+
+    text = raw.strip()
+    fenced = re.match(r'^```(?:json)?\s*(.*?)\s*```$', text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    data = _load_json_object(text)
+    if not isinstance(data, dict):
+        return ''
+    value = data.get('learning')
+    if not isinstance(value, str):
+        return ''
+    value = _clean_str(value, BRAIN_LEARN_MAX_LEARNING)
+    if _looks_like_reasoning(value):
+        return ''
+    return value
+
+
+async def distill_learning(request, question: str, answer: str, user=None) -> str | None:
+    """Extrai UMA aprendizagem da conversa (``''`` se não houver nada útil).
+
+    Devolve ``None`` quando o LLM falhou (sem poluir a memória com texto
+    cru); ``''`` quando o modelo decidiu que não há nada de novo.
+    """
+    question = (question or '').strip()
+    answer = (answer or '').strip()
+    if not question or not answer:
+        return None
+
+    models = getattr(request.app.state, 'MODELS', None) or {}
+    model = resolve_model(user, 'organize', models)
+    if not model:
+        log.debug('brain: no model available to distil learnings')
+        return None
+
+    prompt = DISTILL_PROMPT_TEMPLATE.replace('{question}', question[:BRAIN_LEARN_MAX_QUESTION]).replace(
+        '{answer}', answer[:8000]
+    )
+    form_data = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'stream': False,
+        'temperature': 0,
+        'max_tokens': 600,
+    }
+
+    try:
+        raw = await complete_with_provider(request, form_data, user, model)
+    except Exception:
+        log.warning('brain: learning distillation failed', exc_info=True)
+        return None
+
+    return parse_learning(raw)
+
+
+##############################################
+# Contexto do cérebro para o completion normal
+#
+# O modo já não substitui o completion: o chat normal continua a correr
+# (modelo, pesquisa web, código) e recebe ESTE bloco como contexto.
+##############################################
+
+BRAIN_CONTEXT_EXCERPT_CHARS = 2000
+BRAIN_CONTEXT_HEADER = 'CONHECIMENTO PESSOAL DO UTILIZADOR (base TugaAI, memória de longo prazo):'
+
+
+def _format_brain_context(
+    memory_index: str, insights: list, docs: list, excerpts: list
+) -> str:
+    """Bloco de contexto pronto para injectar no completion (formato fixo)."""
+    lines: list[str] = [BRAIN_CONTEXT_HEADER, '']
+
+    lines.append('Índice de memória:')
+    lines.append((memory_index or '').strip() or '(ainda sem índice de memória)')
+    lines.append('')
+
+    insight_lines = []
+    for insight in insights[:BRAIN_REFLECTION_MAX_INSIGHTS]:
+        if not isinstance(insight, dict):
+            continue
+        topic = _clean_str(str(insight.get('topic') or ''), 120)
+        summary = _clean_str(str(insight.get('summary') or ''), 400)
+        if topic and summary:
+            insight_lines.append(f'- {topic}: {summary}')
+    if insight_lines:
+        lines.append('Insights:')
+        lines.extend(insight_lines)
+        lines.append('')
+
+    doc_lines = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        brain = doc.get('brain') or {}
+        title = _clean_str(str(brain.get('title') or doc.get('filename') or ''), 160)
+        category = _clean_str(str(brain.get('category') or 'other'), 40)
+        filename = _clean_str(str(doc.get('filename') or ''), 200)
+        summary = _clean_str(str(brain.get('summary') or ''), 400)
+        if not title and not summary:
+            continue
+        line = f'- {title} [{category}]'
+        if filename:
+            line += f' ({filename})'
+        if summary:
+            line += f': {summary}'
+        doc_lines.append(line)
+    if doc_lines:
+        lines.append('Documentos relevantes:')
+        lines.extend(doc_lines)
+        lines.append('')
+
+    excerpt_blocks = []
+    for name, text in excerpts:
+        text = (text or '').strip()[:BRAIN_CONTEXT_EXCERPT_CHARS]
+        if text:
+            excerpt_blocks.append(f'=== {name} ===\n{text}')
+    if excerpt_blocks:
+        lines.append('Excertos:')
+        for block in excerpt_blocks:
+            lines.append(block)
+
+    return '\n'.join(lines).strip()
+
+
+async def build_brain_context(question: str, limit: int = 6) -> dict:
+    """Contexto do cérebro para injectar no completion do chat normal.
+
+    Sem LLM (rápido, local): índice de memória + insights da última reflexão
+    (``load_reflection``), as ``limit`` fichas mais recentes que casem com a
+    pergunta (``find_cards_for_question``/``card_matches``; sem matches, as
+    mais recentes via ``_recent_cards``) e excertos do conteúdo real
+    (``_load_excerpts``, cap de 2000 chars/ficheiro).
+
+    Devolve ``{'context': <bloco pronto>, 'sources': [ficheiros], 'memory_index'}``.
+    Nunca levanta exceção — em erro devolve dict parcial.
+    """
+    question = (question or '').strip()
+    result: dict = {'context': '', 'sources': [], 'memory_index': ''}
+
+    memory_index = ''
+    insights: list = []
+    try:
+        state = load_reflection()
+        if isinstance(state, dict):
+            if isinstance(state.get('memory_index'), str):
+                memory_index = state['memory_index'][:4000]
+            if isinstance(state.get('insights'), list):
+                insights = state['insights']
+    except Exception:
+        log.warning('brain: could not read reflection for brain context', exc_info=True)
+
+    result['memory_index'] = memory_index
+
+    matched: list[dict] = []
+    try:
+        if question:
+            matched = await find_cards_for_question(question, limit=limit)
+            if not matched:
+                matched = await _recent_cards(limit)
+    except Exception:
+        log.warning('brain: could not match cards for brain context', exc_info=True)
+        matched = []
+    matched = matched[:limit]
+
+    excerpts: list = []
+    try:
+        excerpts = await _load_excerpts(matched)
+    except Exception:
+        log.warning('brain: could not load excerpts for brain context', exc_info=True)
+        excerpts = []
+
+    result['sources'] = [
+        name
+        for name in (card.get('filename') if isinstance(card, dict) else None for card in matched)
+        if isinstance(name, str) and name
+    ]
+
+    has_content = bool(memory_index.strip() or matched or excerpts)
+    if not has_content:
+        return result
+
+    try:
+        result['context'] = _format_brain_context(memory_index, insights, matched, excerpts)
+    except Exception:
+        log.warning('brain: could not format brain context', exc_info=True)
+        result['context'] = BRAIN_CONTEXT_HEADER
+
+    return result
+
+
+##############################################
+# Aprendizagem por conversa — write-back em modo cérebro
+#
+# No fim de um turno, a pergunta+resposta tornam-se uma NOTA (ficheiro na
+# base, com ficha brain criada em background) — visível no gestor/cronologia
+# e indexável. Nunca levanta exceção para o utilizador.
+##############################################
+
+def build_conversation_note(question: str, answer: str, sources: list[str] | None = None) -> str:
+    """Nota markdown de uma conversa aprendida (formato fixo)."""
+    from datetime import datetime
+
+    stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+    clean_sources = [str(item).strip() for item in (sources or []) if str(item).strip()]
+    sources_line = ' · '.join(clean_sources) if clean_sources else '—'
+    return (
+        f'# Conversa com o cérebro — {stamp}\n\n'
+        f'**Pergunta:** {question.strip()}\n\n'
+        f'**Resposta:** {answer.strip()}\n\n'
+        f'**Fontes citadas:** {sources_line}\n'
+    )
+
+
+async def learn_from_conversation(
+    user,
+    question: str,
+    answer: str,
+    sources: list[str] | None = None,
+    request=None,
+) -> str | None:
+    """Cria uma nota-ficheiro com a conversa e agenda a sua organização.
+
+    O ficheiro entra na base como documento normal (``data.content``); a ficha
+    brain (título/resumo/tags/entidades) é criada em background via
+    ``schedule_organize`` e o índice de memória é re-agendado via
+    ``schedule_reflection``. Devolve o filename ou None; nunca levanta exceção.
+    """
+    try:
+        question = (question or '').strip()
+        answer = (answer or '').strip()
+        if len(question) < 10 or len(answer) < 50:
+            return None
+
+        import io
+        from datetime import datetime
+        from uuid import uuid4
+
+        from open_webui.models.files import FileForm, Files
+
+        timestamp = datetime.now()
+        filename = f'conversa-cerebro-{timestamp.strftime("%Y%m%d-%H%M%S")}.txt'
+        file_id = str(uuid4())
+        content = build_conversation_note(question, answer, sources)
+        raw = content.encode('utf-8')
+
+        path = filename
+        try:
+            from open_webui.storage.provider import Storage
+
+            _, path = await asyncio.to_thread(Storage.upload_file, io.BytesIO(raw), filename, {})
+        except Exception:
+            # Sem storage utilizável: o conteúdo vive em data.content mesmo assim.
+            log.debug('brain: storage upload skipped for %s', filename, exc_info=True)
+
+        file_item = await Files.insert_new_file(
+            user.id,
+            FileForm(
+                id=file_id,
+                filename=filename,
+                path=path,
+                data={'content': content},
+                meta={'name': filename, 'size': len(raw)},
+            ),
+        )
+        if not file_item:
+            log.warning('brain: could not insert conversation note %s', filename)
+            return None
+
+        if request is not None:
+            try:
+                schedule_organize(request, file_item.id, user)
+            except Exception:
+                log.warning('brain: could not schedule organise for %s', filename, exc_info=True)
+            try:
+                schedule_reflection(request.app)
+            except Exception:
+                log.warning('brain: could not schedule reflection after learn', exc_info=True)
+
+        log.info('brain: conversation saved as %s (file %s)', filename, file_item.id)
+        return filename
+    except Exception:
+        log.warning('brain: learn_from_conversation failed', exc_info=True)
+        return None
 
 
 async def brain_reflection_loop(app) -> None:

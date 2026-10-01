@@ -9,7 +9,7 @@
 	export let reflection: any = null;
 </script>
 
-{#if reflection?.memory_index || (reflection?.insights ?? []).length > 0 || (reflection?.stats?.documents ?? 0) > 0}
+{#if reflection?.memory_index || (reflection?.insights ?? []).length > 0 || (reflection?.stats?.documents ?? 0) > 0 || (reflection?.learnings ?? []).length > 0}
 	<section
 		class="mb-6 rounded-2xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900"
 	>
@@ -54,6 +54,19 @@
 						{/if}
 					</div>
 				{/each}
+			</div>
+		{/if}
+		<!-- Aprendizagens guardadas no write-back dos turnos em modo cérebro -->
+		{#if (reflection?.learnings ?? []).length > 0}
+			<div class="mt-3 border-t border-gray-100 pt-3 dark:border-gray-800">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-400">
+					{$i18n.t('What I learned:')}
+				</div>
+				<ul class="mt-1.5 space-y-1.5">
+					{#each reflection.learnings as learning, index (index)}
+						<li class="text-sm leading-6 text-gray-600 dark:text-gray-300">{learning}</li>
+					{/each}
+				</ul>
 			</div>
 		{/if}
 		<!-- Estatísticas: o cérebro calcula com TODOS os ficheiros,

@@ -3062,6 +3062,42 @@
 				createMessagesList(history, message.id)
 			);
 
+			// Modo cérebro: write-back — guarda o que esta conversa ensinou
+			// como nota indexável no cérebro. Fire-and-forget, sem toasts;
+			// só em turnos iniciados por submitPrompt (nem regenerate/continue)
+			// e só UMA vez por resposta (flag por mensagem + brainLearnTurn).
+			if (
+				brainLearnTurn &&
+				$brainMode &&
+				!message.error &&
+				!message.brainLearned &&
+				String(message.content ?? '').trim() !== ''
+			) {
+				const question = brainLearnTurn.question;
+				const fallbackSources = brainLearnTurn.sources ?? [];
+				brainLearnTurn = null;
+				message.brainLearned = true;
+				history.messages[message.id] = message;
+
+				const sources = extractBrainSourceNames(message.sources);
+				learnFromConversation(
+					question,
+					message.content ?? '',
+					sources.length > 0 ? sources : fallbackSources
+				).then((saved) => {
+					if (!saved) return;
+					const target = history.messages[message.id];
+					if (!target || target.brainSaved) return;
+					target.brainSaved = true;
+					target.statusHistory = [
+						...(target.statusHistory ?? []),
+						{ action: 'brain_saved', description: $i18n.t('Saved to the brain') }
+					];
+					history.messages[message.id] = target;
+					history = history;
+				});
+			}
+
 			// Process next queued request if any
 			await processNextInQueue(chatId);
 		}
@@ -3073,127 +3109,99 @@
 	// Chat functions
 	//////////////////////////
 
-	const askBrain = async (question: string) => {
-		const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/ask`, {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${localStorage.token}`,
-				'Content-Type': 'application/json'
-			},
-			credentials: 'include',
-			body: JSON.stringify({ question })
-		});
+	// Turno em modo cérebro que espera pelo write-back (aprendizagem).
+	// Só é definido em submitPrompt — regenerate/continue nunca o definem.
+	let brainLearnTurn: { question: string; sources: string[] } | null = null;
 
-		if (!res.ok) {
-			throw new Error(`brain request failed with status ${res.status}`);
+	const BRAIN_CONTEXT_TIMEOUT_MS = 8000;
+
+	// GET /brain/context — memória do cérebro pronta a injectar no completion.
+	// Falha nunca bloqueia o chat: devolve null e o completion segue sem contexto.
+	const fetchBrainContext = async (question: string) => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), BRAIN_CONTEXT_TIMEOUT_MS);
+		try {
+			const res = await fetch(
+				`${WEBUI_BASE_URL}/api/v1/files/brain/context?question=${encodeURIComponent(question)}`,
+				{
+					method: 'GET',
+					headers: {
+						Authorization: `Bearer ${localStorage.token}`
+					},
+					credentials: 'include',
+					signal: controller.signal
+				}
+			);
+			if (!res.ok) return null;
+			const data = await res.json();
+			return data && typeof data === 'object' ? data : null;
+		} catch (error) {
+			console.warn('brain context unavailable — continuing without it', error);
+			return null;
+		} finally {
+			clearTimeout(timer);
 		}
-
-		return await res.json();
 	};
 
-	const brainSourcesToCitations = (sources: any) =>
-		(Array.isArray(sources) ? sources : [])
-			.filter((source) => typeof source === 'string' && source.trim() !== '')
-			.map((name) => ({
-				source: { id: name, name },
-				document: [name],
-				metadata: [{ source: name, name }]
-			}));
+	const BRAIN_INSTRUCTIONS =
+		'Responde em português de Portugal: directo, útil e com raciocínio. Usa o conhecimento pessoal acima como BASE PRINCIPAL (cita os documentos pelas fontes). Se as integrações de pesquisa web ou código estiverem activas, complementa com elas.';
 
-	const sendBrainMessage = async (parentId: string) => {
-		if (autoScroll) {
-			scrollToBottom();
-		}
+	// Bloco EXACTO que viaja no payload do completion (nunca no chat guardado).
+	const buildBrainCompletionUserContent = (question: string, contextBlock: string): string =>
+		`${question}
 
-		const question = history.messages[parentId]?.content ?? '';
-		const modelId =
-			atSelectedModel !== undefined ? atSelectedModel.id : (selectedModels ?? []).at(0);
-		const model = $models.filter((m) => m.id === modelId).at(0);
+--- CONTEXTO DO CÉREBRO ---
+${contextBlock}
+--- FIM DO CONTEXTO ---
 
-		const responseMessageId = uuidv4();
-		const responseMessage: any = {
-			parentId,
-			id: responseMessageId,
-			childrenIds: [],
-			role: 'assistant',
-			content: '',
-			done: false,
-			model: model?.id ?? modelId,
-			modelName: model?.name ?? model?.id ?? modelId,
-			modelIdx: 0,
-			timestamp: Math.floor(Date.now() / 1000),
-			statusHistory: [{ action: 'brain_think', description: $i18n.t('Asking the brain…') }]
-		};
+${BRAIN_INSTRUCTIONS}`;
 
-		history.messages[responseMessageId] = responseMessage;
-		history.currentId = responseMessageId;
-		if (parentId !== null && history.messages[parentId]) {
-			history.messages[parentId].childrenIds = [
-				...history.messages[parentId].childrenIds,
-				responseMessageId
-			];
-		}
-		history = history;
-
-		await tick();
-
-		generating = true;
-
-		try {
-			let _chatId = JSON.parse(JSON.stringify($chatId));
-
-			if (!_chatId) {
-				if (embedded && onCreateEmbeddedChat) {
-					const createdChat = await onCreateEmbeddedChat();
-					if (!createdChat?.id) {
-						throw new Error('failed to create chat');
-					}
-
-					chat = createdChat;
-					_chatId = createdChat.id;
-					loadedChatIdProp = _chatId;
-					await chatId.set(_chatId);
-					await chatTitle.set(createdChat?.chat?.title ?? createdChat?.title ?? $i18n.t('Chat'));
-					params = structuredClone(createdChat?.chat?.params ?? {});
-					delete params.note_id;
-					chatFiles = mergeFiles(chatFiles, createdChat?.chat?.files ?? []);
-					await onSelectEmbeddedChat?.(_chatId);
-				} else {
-					_chatId = await initChatHandler(history);
-				}
-				await tick();
+	// Fontes citadas da resposta (web search/citações) → nomes de texto.
+	const extractBrainSourceNames = (sources: any): string[] => {
+		if (!Array.isArray(sources)) return [];
+		const names: string[] = [];
+		for (const source of sources) {
+			let name: unknown = null;
+			if (typeof source === 'string') {
+				name = source;
+			} else if (source && typeof source === 'object') {
+				name =
+					source?.source?.name ??
+					source?.source?.id ??
+					source?.name ??
+					(Array.isArray(source?.document) ? source.document[0] : null);
 			}
+			if (typeof name === 'string' && name.trim()) {
+				names.push(name.trim());
+			}
+		}
+		return [...new Set(names)].slice(0, 16);
+	};
 
-			const data = await askBrain(question);
-
-			responseMessage.content = data?.answer ?? '';
-			responseMessage.sources = brainSourcesToCitations(data?.sources);
+	// Write-back: guarda o que a conversa ensinou (fire-and-forget, sem toasts).
+	// POST /brain/learn cria uma nota indexável no cérebro (ficha em background).
+	const learnFromConversation = async (
+		question: string,
+		answer: string,
+		sources: string[]
+	): Promise<boolean> => {
+		try {
+			const res = await fetch(`${WEBUI_BASE_URL}/api/v1/files/brain/learn`, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${localStorage.token}`,
+					'Content-Type': 'application/json'
+				},
+				credentials: 'include',
+				body: JSON.stringify({ question, answer, sources })
+			});
+			if (!res.ok) return false;
+			const data = await res.json();
+			return data?.status === true && !!data?.filename;
 		} catch (error) {
-			console.error(error);
-
-			const errorMessage = $i18n.t('Uh-oh! There was an issue with the response.');
-			toast.error(errorMessage);
-
-			responseMessage.error = { content: errorMessage, raw: error };
-		} finally {
-			responseMessage.statusHistory = [];
-			responseMessage.done = true;
-			history.messages[responseMessageId] = responseMessage;
-			history.currentId = responseMessageId;
-			history = history;
-			generating = false;
+			console.warn('brain learning write-back failed', error);
+			return false;
 		}
-
-		await tick();
-
-		if (shouldAutoScrollResponse()) {
-			scrollToBottom();
-		}
-
-		if ($chatId) {
-			await saveChatHandler($chatId, history);
-		}
-		await processNextInQueue($chatId);
 	};
 
 	const submitPrompt = async (inputContent, inputFiles) => {
@@ -3241,8 +3249,22 @@
 
 		saveSessionSelectedModels();
 
+		brainLearnTurn = null;
+
 		if ($brainMode) {
-			await sendBrainMessage(userMessageId);
+			if (selectedModels.includes('')) {
+				// Sem modelo escolhido o completion normal não corre — o modo
+				// cérebro já NÃO substitui o modelo (era o fluxo antigo).
+				toast.error($i18n.t('Model not selected'));
+				return;
+			}
+
+			// Modo cérebro: o completion NORMAL continua a correr (modelo,
+			// pesquisa web, código…). O contexto do cérebro é buscado dentro
+			// de sendMessage (com estado na mensagem do assistente) e viaja
+			// SÓ no payload do completion — a pergunta guardada fica pura.
+			brainLearnTurn = { question: inputContent, sources: [] };
+			await sendMessage(history, userMessageId, { brainQuestion: inputContent });
 			return;
 		}
 
@@ -3526,12 +3548,14 @@
 			messages = null,
 			modelId = null,
 			modelIdx = null,
-			regenerationPrompt = null
+			regenerationPrompt = null,
+			brainQuestion = null
 		}: {
 			messages?: any[] | null;
 			modelId?: string | null;
 			modelIdx?: number | null;
 			regenerationPrompt?: string | null;
+			brainQuestion?: string | null;
 		} = {}
 	) => {
 		if (autoScroll) {
@@ -3624,6 +3648,40 @@
 			await tick();
 		}
 
+		// Modo cérebro: busca a memória do cérebro ANTES do completion, com
+		// estado visível na mensagem do assistente. O bloco devolvido viaja
+		// SÓ no payload — a mensagem guardada do utilizador fica com a pergunta pura.
+		let brainPayloadContext: { block: string; sources: string[] } | null = null;
+		if (brainQuestion) {
+			const targetId = messageIdsList[0]?.message_id;
+			const target = targetId ? history.messages[targetId] : null;
+			if (target) {
+				target.statusHistory = [
+					{ action: 'brain_think', description: $i18n.t("Consulting the brain's memory…") }
+				];
+				history.messages[target.id] = target;
+				history = history;
+				await tick();
+			}
+
+			const brainData = await fetchBrainContext(brainQuestion);
+			if (target && history.messages[target.id]) {
+				history.messages[target.id].statusHistory = [];
+			}
+			history = history;
+
+			const block = typeof brainData?.context === 'string' ? brainData.context.trim() : '';
+			if (block) {
+				const contextSources = Array.isArray(brainData?.sources)
+					? brainData.sources.filter((s: unknown) => typeof s === 'string' && s)
+					: [];
+				brainPayloadContext = { block, sources: contextSources };
+				if (brainLearnTurn && brainLearnTurn.question === brainQuestion) {
+					brainLearnTurn.sources = contextSources;
+				}
+			}
+		}
+
 		await tick();
 
 		// Re-clone history so sendMessageSocket gets the response messages we just added
@@ -3674,10 +3732,11 @@
 					{
 						// Always forward the message_ids list (not just for multi-model sends) so the
 						// backend persists each response's modelIdx — including single-column
-						// regenerations in a duplicate-model chat, which would otherwise lose their
+						// regenerations in a duplicate-model chat, which would otherwise lose its
 						// column identity and collapse on reload.
 						messageIdsList: messageIdsList.length > 0 ? messageIdsList : undefined,
-						regenerationPrompt
+						regenerationPrompt,
+						brainContext: brainPayloadContext
 					}
 				);
 			} finally {
@@ -3732,11 +3791,13 @@
 		{
 			messageIdsList,
 			regenerationPrompt,
-			continueResponse = false
+			continueResponse = false,
+			brainContext = null
 		}: {
 			messageIdsList?: Array<{ model_id: string; message_id: string }>;
 			regenerationPrompt?: string | null;
 			continueResponse?: boolean;
+			brainContext?: { block: string; sources: string[] } | null;
 		} = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
@@ -3867,6 +3928,40 @@
 			}
 		}
 
+		// Modo cérebro: o bloco de contexto viaja SÓ no payload do completion —
+		// nunca no objecto da mensagem guardada (o utilizador não o vê no balão
+		// nem no chat persistido). Em chats temporários o cliente constrói as
+		// mensagens → injecta-se na última mensagem do utilizador; em chats
+		// guardados o servidor reconstrói o histórico a partir da BD e descarta
+		// as mensagens do cliente EXCETO a system message → aí injeta-se lá.
+		if (brainContext?.block) {
+			let lastUserIdx = -1;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if (messages[i]?.role === 'user') {
+					lastUserIdx = i;
+					break;
+				}
+			}
+
+			if ($temporaryChatEnabled && lastUserIdx >= 0) {
+				const question = String(userMessage?.content ?? '');
+				messages[lastUserIdx] = {
+					...messages[lastUserIdx],
+					content: buildBrainCompletionUserContent(question, brainContext.block)
+				};
+			} else {
+				const systemBlock = `${brainContext.block}\n\n${BRAIN_INSTRUCTIONS}`;
+				if (messages[0]?.role === 'system') {
+					messages[0] = {
+						...messages[0],
+						content: `${messages[0].content}\n\n${systemBlock}`
+					};
+				} else {
+					messages.unshift({ role: 'system', content: systemBlock });
+				}
+			}
+		}
+
 		const toolIds = [];
 		const toolServerIds = [];
 
@@ -3983,6 +4078,9 @@
 				// Keep the untouched provider payload for debugging (admins only).
 				raw: error
 			};
+
+			// Turno falhado → não fica pendente um write-back antigo.
+			brainLearnTurn = null;
 
 			responseMessage.done = true;
 

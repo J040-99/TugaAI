@@ -623,10 +623,21 @@ class BrainListResponse(BaseModel):
 
 @router.get('/brain/state', response_model=dict)
 async def get_brain_state(user=Depends(get_verified_user)):
-    """Última reflexão periódica do cérebro (stats, índice de memória, insights)."""
-    from open_webui.utils.brain import load_reflection
+    """Última reflexão periódica do cérebro (stats, índice de memória, insights).
 
-    return load_reflection()
+    Inclui as últimas ``learnings`` (aprendizagens guardadas no write-back
+    dos turnos em modo cérebro) para a página /brain.
+    """
+    from open_webui.utils.brain import load_reflection, recent_learnings
+
+    state = load_reflection()
+    if not isinstance(state, dict):
+        state = {}
+    try:
+        state['learnings'] = recent_learnings()
+    except Exception:
+        state['learnings'] = []
+    return state
 
 
 @router.get('/brain', response_model=BrainListResponse)
@@ -707,6 +718,65 @@ async def ask_brain(request: Request, form_data: BrainAskForm, user=Depends(get_
             status_code=503, detail='O cérebro não está disponível de momento. Tenta outra vez.'
         )
     return result
+
+
+@router.get('/brain/context', response_model=dict)
+async def get_brain_context(
+    question: str = Query(..., min_length=1, description='Pergunta do utilizador'),
+    limit: int = Query(6, ge=1, le=20, description='Máximo de fichas relevantes'),
+    user=Depends(get_verified_user),
+):
+    """Contexto do cérebro para injectar no completion do chat (modo cérebro).
+
+    Devolve ``{context, sources, memory_index}`` — ``context`` é um bloco
+    pronto a injectar no pedido de completion. Nunca falha: em erro devolve
+    dict parcial (o chat segue sem contexto).
+    """
+    from open_webui.utils.brain import build_brain_context
+
+    try:
+        return await build_brain_context(question, limit=limit)
+    except Exception:
+        log.warning('brain: context endpoint failed', exc_info=True)
+        return {'context': '', 'sources': [], 'memory_index': ''}
+
+
+class BrainLearnForm(BaseModel):
+    question: str
+    answer: str
+    sources: list[str] = []
+
+
+@router.post('/brain/learn', response_model=dict)
+async def learn_brain(request: Request, form_data: BrainLearnForm, user=Depends(get_verified_user)):
+    """Write-back do modo cérebro: a conversa torna-se uma nota indexável.
+
+    Validação: pergunta ≥ 10 caracteres e resposta ≥ 50 caracteres (senão 400).
+    A ficha brain é criada em background; a nota fica visível no gestor.
+    """
+    from open_webui.utils.brain import learn_from_conversation
+
+    question = (form_data.question or '').strip()
+    answer = (form_data.answer or '').strip()
+    if len(question) < 10 or len(answer) < 50:
+        raise HTTPException(
+            status_code=400,
+            detail='Pergunta (mín. 10 caracteres) e resposta (mín. 50 caracteres) obrigatórias.',
+        )
+
+    try:
+        filename = await learn_from_conversation(
+            user, question, answer, form_data.sources or [], request
+        )
+    except Exception:
+        log.warning('brain: learn endpoint failed', exc_info=True)
+        filename = None
+
+    if not filename:
+        raise HTTPException(
+            status_code=503, detail='Não foi possível guardar a conversa no cérebro. Tenta outra vez.'
+        )
+    return {'status': True, 'filename': filename}
 
 
 class BrainCardForm(BaseModel):
