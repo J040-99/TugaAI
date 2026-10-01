@@ -3163,7 +3163,7 @@
 	};
 
 	const BRAIN_INSTRUCTIONS =
-		'Responde em português de Portugal: directo, útil e com raciocínio. Usa o conhecimento pessoal acima como BASE PRINCIPAL (cita os documentos pelas fontes). Se as integrações de pesquisa web ou código estiverem activas, complementa com elas.';
+		'Responde em português de Portugal: directo, útil e com raciocínio. Usa o conhecimento pessoal acima como BASE PRINCIPAL (cita os documentos pelas fontes). Se as integrações de pesquisa web ou código estiverem activas, complementa com elas. Quando pedirem código ou um ficheiro (HTML, CSS, JS, Python, etc.), começa por uma frase de contexto e entrega o código SEMPRE dentro de um bloco cercado com ``` (e a linguagem certa logo a seguir às crases) — nunca solto no texto, para aparecer como bloco de código com botão de cópia.';
 
 	// Bloco EXACTO que viaja no payload do completion (nunca no chat guardado).
 	const buildBrainCompletionUserContent = (question: string, contextBlock: string): string =>
