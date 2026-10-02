@@ -4061,6 +4061,11 @@ ${BRAIN_INSTRUCTIONS}`;
 				params: {
 					...$settings?.params,
 					...params,
+					// O middleware do servidor só força a pesquisa web (Brave) quando
+					// function_calling == 'legacy'; caso contrário fica à espera que o
+					// modelo chame a ferramenta nativamente — o Nemotron free não chama
+					// e a pesquisa nunca corre. Com a lupa ligada, garante-se o legacy.
+					...(webSearchActive ? { function_calling: 'legacy' } : {}),
 					stop: getStopTokens()
 				},
 
