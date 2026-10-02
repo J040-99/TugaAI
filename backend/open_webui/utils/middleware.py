@@ -1612,15 +1612,55 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
             response = response[bracket_start:bracket_end]
             queries = JSONCodec.loads(response)
             queries = queries.get('queries', [])
-        except Exception as e:
+        except Exception:
             queries = [response]
 
         if ENABLE_QUERIES_CACHE:
             request.state.cached_queries = queries
 
     except Exception as e:
-        log.exception(e)
-        queries = [user_message or '']
+        # Em ligações directas (BYOK) o completion de tarefas não tem sessão
+        # WS — gera as queries directamente via HTTP do provedor (mesmo
+        # caminho do Modo Cérebro), que não depende de nenhuma sessão.
+        log.warning(
+            'web search: query generation via task failed (%s); retrying via direct provider', e
+        )
+        queries = []
+        try:
+            from open_webui.utils.brain import complete_with_provider
+
+            direct_form = {
+                'model': form_data['model'],
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': (
+                            'Gera até3 queries curtas e concisas de pesquisa web (pt-PT, sem '
+                            'aspas, sem conversa) para encontrar informação útil na internet '
+                            'sobre o pedido do utilizador. Responde APENAS com JSON no formato: '
+                            '{"queries": ["...", "..."]}\n\nPedido: '
+                            f'{user_message or ""}'
+                        ),
+                    }
+                ],
+                'stream': False,
+                'temperature': 0.1,
+                'max_tokens': 400,
+            }
+            text = await complete_with_provider(
+                request, direct_form, user, form_data['model']
+            )
+            br_start = str(text or '').rfind('{')
+            br_end = str(text or '').rfind('}') + 1
+            if br_start != -1 and br_end > br_start:
+                data = JSONCodec.loads(str(text)[br_start:br_end])
+                parsed = data.get('queries') if isinstance(data, dict) else None
+                if isinstance(parsed, list):
+                    queries = [str(q).strip() for q in parsed if str(q).strip()][:5]
+        except Exception:
+            log.warning('web search: direct query generation failed', exc_info=True)
+        if not queries:
+            queries = [user_message or '']
 
     # Check if generated queries are empty
     if len(queries) == 1 and queries[0].strip() == '':
@@ -2026,7 +2066,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
                     response = response[bracket_start:bracket_end]
                     response = JSONCodec.loads(response)
                     prompt = response.get('prompt', [])
-                except Exception as e:
+                except Exception:
                     prompt = user_message
 
             except Exception as e:
@@ -2127,7 +2167,7 @@ async def chat_completion_files_handler(
 
                     queries_response = queries_response[bracket_start:bracket_end]
                     queries_response = JSONCodec.loads(queries_response)
-                except Exception as e:
+                except Exception:
                     queries_response = {'queries': [queries_response]}
 
                 queries = queries_response.get('queries', [])
@@ -4744,7 +4784,7 @@ async def background_tasks_handler(ctx):
                                 touch=False,
                             )
 
-                    except Exception as e:
+                    except Exception:
                         pass
 
             if is_saved_chat_id(metadata.get('chat_id')):  # Only update titles and tags for saved chats
@@ -4783,7 +4823,7 @@ async def background_tasks_handler(ctx):
 
                             try:
                                 title = JSONCodec.loads(title_string).get('title', user_message)
-                            except Exception as e:
+                            except Exception:
                                 title = ''
 
                             if not title:
@@ -4843,7 +4883,7 @@ async def background_tasks_handler(ctx):
                                     'data': tags,
                                 }
                             )
-                        except Exception as e:
+                        except Exception:
                             pass
 
         if messages:
@@ -5584,7 +5624,7 @@ async def streaming_chat_response_handler(response, ctx):
             try:
                 if form_data['messages'][-1]['role'] == 'assistant':
                     last_assistant_message = get_last_assistant_message(form_data['messages'])
-            except Exception as e:
+            except Exception:
                 pass
 
             initial_content = (
