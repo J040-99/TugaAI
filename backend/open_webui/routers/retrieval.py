@@ -2987,9 +2987,42 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 loader_config=loader_config,
             )
             docs = await loader.aload()
+
+            # Backfill por URL: páginas bloqueadas/sem conteúdo (robots/timeout,
+            # ex.: dges.gov.pt) recebem o snippet do motor — as fontes OFICIAIS
+            # continuam a contribuir mesmo quando o loader só carregou um site.
+            snippet_by_url = {
+                item.link: item for item in result_items if getattr(item, 'snippet', None)
+            }
+
+            def _snippet_doc(link):
+                item = snippet_by_url[link]
+                return Document(
+                    page_content=f'{item.title}\n{item.link}\n{item.snippet}',
+                    metadata={
+                        'source': link,
+                        'title': item.title,
+                        'snippet': item.snippet,
+                        'link': link,
+                    },
+                )
+
+            for doc in docs:
+                if not (doc.page_content or '').strip():
+                    link = doc.metadata.get('source')
+                    if link in snippet_by_url:
+                        doc.page_content = _snippet_doc(link).page_content
+
+            loaded_links = {doc.metadata.get('source') for doc in docs}
+            docs.extend(
+                _snippet_doc(link)
+                for link in urls
+                if link in snippet_by_url and link not in loaded_links
+            )
+
             if not any((doc.page_content or '').strip() for doc in docs):
-                # As páginas não carregaram (bloqueio/robots/timeout): NÃO falhar
-                # a pesquisa — cai para os snippets devolvidos pelo motor.
+                # Nada carregou nem snippets úteis: não falhar a pesquisa —
+                # cai para os snippets existentes mesmo assim.
                 log.warning(
                     'web search: loader returned no content; falling back to snippets (%d url(s))',
                     len(urls),
