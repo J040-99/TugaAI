@@ -2987,6 +2987,26 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 loader_config=loader_config,
             )
             docs = await loader.aload()
+            if not any((doc.page_content or '').strip() for doc in docs):
+                # As páginas não carregaram (bloqueio/robots/timeout): NÃO falhar
+                # a pesquisa — cai para os snippets devolvidos pelo motor.
+                log.warning(
+                    'web search: loader returned no content; falling back to snippets (%d url(s))',
+                    len(urls),
+                )
+                docs = [
+                    Document(
+                        page_content=f'{result.title}\n{result.link}\n{result.snippet}',
+                        metadata={
+                            'source': result.link,
+                            'title': result.title,
+                            'snippet': result.snippet,
+                            'link': result.link,
+                        },
+                    )
+                    for result in result_items
+                    if getattr(result, 'snippet', None)
+                ]
 
         urls = [
             doc.metadata.get('source') for doc in docs if doc.metadata.get('source')
@@ -3012,6 +3032,14 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 'loaded_count': len(docs),
             }
         else:
+            if not docs or not any((doc.page_content or '').strip() for doc in docs):
+                # Nada utilizável (sem snippets nem conteúdo): responde "sem
+                # resultados" em vez de rebentar em500 no vector DB.
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=ERROR_MESSAGES.DEFAULT('No results found from web search'),
+                )
+
             # Create a single collection for all documents
             # Bind the ephemeral collection to its owner so filter_accessible_collections can scope it per-user.
             collection_name = f'web-search-{user.id}-{calculate_sha256_string("-".join(form_data.queries))}'[:63]

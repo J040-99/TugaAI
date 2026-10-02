@@ -3069,6 +3069,15 @@
 				createMessagesList(history, message.id)
 			);
 
+			// HTML solto (sem cercas de código, ex.: "gera um html...") → envolver
+			// no fim para renderizar como bloco de código com botão de cópia e os
+			// artefactos o processarem — modelos free nem sempre obedecem ao fence.
+			const rawHtml = String(message.content ?? '');
+			if (!rawHtml.includes('```') && /^\s*(<!doctype\s+html|<html[\s>])/i.test(rawHtml)) {
+				message.content = '```html\n' + rawHtml.trim() + '\n```';
+				history.messages[message.id] = message;
+			}
+
 			// Modo cérebro: write-back — guarda o que esta conversa ensinou
 			// como nota indexável no cérebro. Fire-and-forget, sem toasts.
 			// O turno pendente é registado UMA vez em sendMessage e consumido
