@@ -1622,12 +1622,24 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
         # Em ligações directas (BYOK) o completion de tarefas não tem sessão
         # WS — gera as queries directamente via HTTP do provedor (mesmo
         # caminho do Modo Cérebro), que não depende de nenhuma sessão.
-        log.warning(
-            'web search: query generation via task failed (%s); retrying via direct provider', e
-        )
+        log.warning('web search: query generation via task failed (%s); retrying via direct provider', e)
         queries = []
         try:
             from open_webui.utils.brain import complete_with_provider
+
+            # Contexto: as queries têm de servir o ASSUNTO em curso, não as
+            # palavras literais da última frase ("procura na net, sou de X").
+            history_lines = []
+            for msg in (form_data.get('messages') or [])[-6:]:
+                if msg.get('role') not in ('user', 'assistant'):
+                    continue
+                content = str(msg.get('content') or '')
+                if '--- CONTEXTO DO CÉREBRO ---' in content:
+                    content = content.split('--- CONTEXTO DO CÉREBRO ---')[0]
+                content = content.strip()[:400]
+                if content:
+                    history_lines.append(f"{msg.get('role')}: {content}")
+            context_block = '\n'.join(history_lines) or '(sem histórico)'
 
             direct_form = {
                 'model': form_data['model'],
@@ -1635,11 +1647,15 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
                     {
                         'role': 'user',
                         'content': (
-                            'Gera até3 queries curtas e concisas de pesquisa web (pt-PT, sem '
-                            'aspas, sem conversa) para encontrar informação útil na internet '
-                            'sobre o pedido do utilizador. Responde APENAS com JSON no formato: '
-                            '{"queries": ["...", "..."]}\n\nPedido: '
-                            f'{user_message or ""}'
+                            'Estás a gerar queries de pesquisa web para um chat. Usa o CONVERSA '
+                            'RECENTE para perceber o assunto em curso; a pesquisa deve servir a '
+                            'PERGUNTA ACTUAL, com o tema do chat (não apenas as palavras '
+                            'literais da frase). Responde APENAS com JSON no formato: '
+                            '{"queries": ["...", "..."]}\n\n'
+                            f'CONVERSA RECENTE:\n{context_block}\n\n'
+                            f'PEDIDO ACTUAL: {user_message or ""}\n\n'
+                            'Gera até3 queries curtas e concisas (pt-PT, sem aspas, sem '
+                            'conversa) que encontrem informação útil sobre o assunto real.'
                         ),
                     }
                 ],
@@ -1647,9 +1663,7 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
                 'temperature': 0.1,
                 'max_tokens': 400,
             }
-            text = await complete_with_provider(
-                request, direct_form, user, form_data['model']
-            )
+            text = await complete_with_provider(request, direct_form, user, form_data['model'])
             br_start = str(text or '').rfind('{')
             br_end = str(text or '').rfind('}') + 1
             if br_start != -1 and br_end > br_start:
@@ -2562,11 +2576,7 @@ def _add_image_reading_hints(form_data) -> None:
             if 'Instruções OBRIGATÓRIAS' not in content:
                 system['content'] = content + IMAGE_READING_HINT
         elif isinstance(content, list):
-            texts = [
-                p.get('text', '')
-                for p in content
-                if isinstance(p, dict) and p.get('type') == 'text'
-            ]
+            texts = [p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text']
             if not any('Instruções OBRIGATÓRIAS' in t for t in texts):
                 content.append({'type': 'text', 'text': IMAGE_READING_HINT.strip()})
 
@@ -2584,11 +2594,7 @@ def _add_image_reading_hints(form_data) -> None:
             if '[Lembrete] Só transcribes' not in content:
                 message['content'] = content + short_note
         elif isinstance(content, list):
-            texts = [
-                p.get('text', '')
-                for p in content
-                if isinstance(p, dict) and p.get('type') == 'text'
-            ]
+            texts = [p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text']
             if not any('[Lembrete] Só transcribes' in t for t in texts):
                 # Insert after the first text part (user prompt), before images.
                 insert_at = 0
@@ -2607,7 +2613,9 @@ def _improve_text_orientation(img):
     Returns (image, was_rotated).
     """
     try:
-        from PIL import ImageOps
+        # `Image` e `ImageOps` no mesmo import: `line_score` usa
+        # `Image.Resampling.BILINEAR` — sem ele, NameError em runtime.
+        from PIL import Image, ImageOps
 
         original = img
         img = ImageOps.exif_transpose(img) or img
@@ -2686,9 +2694,7 @@ def _compress_data_image_url(data_url: str, max_bytes: int) -> tuple[str, bool]:
         for _ in range(10):
             width = max(1, int(img.width * scale))
             height = max(1, int(img.height * scale))
-            resized = (
-                img if (width, height) == img.size else img.resize((width, height), Image.Resampling.LANCZOS)
-            )
+            resized = img if (width, height) == img.size else img.resize((width, height), Image.Resampling.LANCZOS)
             buf = io.BytesIO()
             resized.save(buf, format='JPEG', quality=quality, optimize=True)
             best_bytes = buf.getvalue()
@@ -2774,21 +2780,15 @@ async def _run_image_subagent(
     if hasattr(request.state, 'metadata'):
         saved_state_metadata = dict(request.state.metadata or {})
         request.state.metadata = {
-            k: v
-            for k, v in saved_state_metadata.items()
-            if k not in ('session_id', 'socket_id', 'sid')
+            k: v for k, v in saved_state_metadata.items() if k not in ('session_id', 'socket_id', 'sid')
         }
 
     try:
         async with semaphore:
-            response = await generate_chat_completion(
-                request, form_data=payload, user=user, bypass_filter=True
-            )
+            response = await generate_chat_completion(request, form_data=payload, user=user, bypass_filter=True)
             return (_extract_response_text(response) or '').strip()
     except Exception:
-        log.exception(
-            'image sub-agent batch %d/%d failed', batch_idx + 1, total_batches
-        )
+        log.exception('image sub-agent batch %d/%d failed', batch_idx + 1, total_batches)
         return ''
     finally:
         if saved_state_metadata is not None:
@@ -2959,9 +2959,7 @@ async def fit_images_into_budget(
     done_count = 0
 
     async def _run_one(idx: int, chunk: list[dict]) -> tuple[int, str]:
-        summary = await _run_image_subagent(
-            request, user, model_id, chunk, idx + 1, total_batches, semaphore
-        )
+        summary = await _run_image_subagent(request, user, model_id, chunk, idx + 1, total_batches, semaphore)
         # Keep-alive: progress after every batch so the socket stays warm
         # and the user sees movement during long runs.
         if event_emitter:
@@ -2980,9 +2978,7 @@ async def fit_images_into_budget(
                 log.debug('image_batch keep-alive emit failed')
         return idx, summary
 
-    task_list = [
-        asyncio.create_task(_run_one(idx, chunk)) for idx, chunk in enumerate(batches)
-    ]
+    task_list = [asyncio.create_task(_run_one(idx, chunk)) for idx, chunk in enumerate(batches)]
     results: list[str] = [''] * total_batches
     for fut in asyncio.as_completed(task_list):
         idx, summary = await fut
@@ -2994,7 +2990,9 @@ async def fit_images_into_budget(
     for idx, (batch_parts, summary) in enumerate(zip(batches, results)):
         if not summary:
             continue
-        block = f'[Imagens {idx * IMAGE_BATCH_SIZE + 1}–{idx * IMAGE_BATCH_SIZE + len(batch_parts)} da conversa]\n{summary}'
+        block = (
+            f'[Imagens {idx * IMAGE_BATCH_SIZE + 1}–{idx * IMAGE_BATCH_SIZE + len(batch_parts)} da conversa]\n{summary}'
+        )
         for message in messages:
             content = message.get('content')
             if not isinstance(content, list):
@@ -7132,9 +7130,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
 
                         new_form_data = await convert_url_images_to_base64(new_form_data, user=user)
-                        await fit_images_into_budget(
-                            request, user, new_form_data, model_id=new_form_data.get('model')
-                        )
+                        await fit_images_into_budget(request, user, new_form_data, model_id=new_form_data.get('model'))
 
                         if filter_functions:
                             new_form_data, _ = await process_filter_functions(
