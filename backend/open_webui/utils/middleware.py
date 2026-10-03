@@ -1624,6 +1624,7 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
         # caminho do Modo Cérebro), que não depende de nenhuma sessão.
         log.warning('web search: query generation via task failed (%s); retrying via direct provider', e)
         queries = []
+        queries_ok = False  # lista vazia do modelo = decisão válida: não pesquisar
         try:
             from open_webui.utils.brain import complete_with_provider
 
@@ -1638,7 +1639,7 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
                     content = content.split('--- CONTEXTO DO CÉREBRO ---')[0]
                 content = content.strip()[:400]
                 if content:
-                    history_lines.append(f"{msg.get('role')}: {content}")
+                    history_lines.append(f'{msg.get("role")}: {content}')
             context_block = '\n'.join(history_lines) or '(sem histórico)'
 
             direct_form = {
@@ -1655,7 +1656,10 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
                             f'CONVERSA RECENTE:\n{context_block}\n\n'
                             f'PEDIDO ACTUAL: {user_message or ""}\n\n'
                             'Gera até3 queries curtas e concisas (pt-PT, sem aspas, sem '
-                            'conversa) que encontrem informação útil sobre o assunto real.'
+                            'conversa) que encontrem informação útil sobre o assunto real. SE a '
+                            'pergunta já se responder com o CONTEXTO (características, resumas, '
+                            'opiniões sobre ficheiros ou documentos já mencionados), devolve '
+                            '{"queries": []} — indica que NÃO é preciso pesquisar na internet.'
                         ),
                     }
                 ],
@@ -1671,9 +1675,10 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
                 parsed = data.get('queries') if isinstance(data, dict) else None
                 if isinstance(parsed, list):
                     queries = [str(q).strip() for q in parsed if str(q).strip()][:5]
+                    queries_ok = True  # mesmo [] = o modelo decidiu: não pesquisar
         except Exception:
             log.warning('web search: direct query generation failed', exc_info=True)
-        if not queries:
+        if not queries and not queries_ok:
             queries = [user_message or '']
 
     # Check if generated queries are empty
